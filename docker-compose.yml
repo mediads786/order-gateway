@@ -18,6 +18,7 @@ services:
     build: .
     environment:
       DATABASE_URL: postgresql+psycopg://order_gateway:order_gateway@db:5432/order_gateway
+      SHOPIFY_WEBHOOK_SECRET: ${SHOPIFY_WEBHOOK_SECRET:-}
     ports:
       - "127.0.0.1:8002:8000"
     healthcheck:

@@ -1,4 +1,4 @@
-# Order Gateway — Modules 1–3: Intake, Queue, Worker, Retries, and Mock ERP
+# Order Gateway — Modules 1–3B: Intake, Queue, Worker, Retries, Shopify, and Mock ERP
 
 Accepts canonical orders, computes totals with `Decimal`, stores raw and canonical data, enforces idempotency, and records audit events. Valid orders atomically receive a queued job; a separate worker sends them to the in-memory mock ERP.
 
@@ -16,6 +16,7 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 Copy-Item .env.example .env
+$env:SHOPIFY_WEBHOOK_SECRET = "replace-with-shopify-webhook-secret"
 docker compose up -d --build
 .\.venv\Scripts\python.exe -m pytest -v
 ```
@@ -52,3 +53,39 @@ The API and worker read `DATABASE_URL`. Tests use `TEST_DATABASE_URL`, shown in 
 ## Stale job recovery
 
 The worker recovers jobs left in `PROCESSING` past `STALE_JOB_SECONDS`; recovered jobs retry unless they have reached `MAX_ATTEMPTS`.
+
+## Shopify `orders/create` webhook
+
+1. The endpoint reads the raw request bytes once; Shopify's HMAC-SHA256 signature is verified against those exact bytes before parsing or storing anything.
+2. An empty or unset `SHOPIFY_WEBHOOK_SECRET` returns `503`; a missing or invalid signature returns `401`, and neither case stores data.
+3. A missing webhook ID returns `400`; a present topic other than `orders/create` is acknowledged with `200 {"status":"ignored"}` and is not stored.
+4. A valid `orders/create` body maps to only the canonical fields below, is serialized deterministically, and goes through the existing `submit_order` path and queue.
+5. New, replayed, and rejected orders return `200` with the order ID and status; bad payloads return `200` after storage as `REJECTED` so Shopify does not retry permanent input errors forever.
+
+Configure `SHOPIFY_WEBHOOK_SECRET` with the secret for this subscription. The endpoint accepts the legacy `X-Shopify-*` webhook headers only; newer Events delivery header names without `X-` are unsupported.
+
+### Shopify mapping
+
+| Canonical field | Shopify path (first usable value wins) | Rule |
+| --- | --- | --- |
+| `source` | Constant | `shopify` |
+| `external_ref` | `id` | Convert to string |
+| `customer.name` | `customer.first_name` + `customer.last_name`; then `shipping_address.name`; then `billing_address.name` | Join non-empty name parts with one space, trim, and reject if no usable value |
+| `customer.email` | `email`; then `customer.email` | Trim; omit if neither is usable |
+| `customer.phone` | `phone`; then `customer.phone`; then `shipping_address.phone` | Trim; omit if none is usable |
+| Contact requirement | `customer.email` or `customer.phone` | Reject if both are absent or empty |
+| `currency` | `currency` | Keep as supplied; canonical validation requires a three-letter code |
+| `lines[].sku` | `line_items[].sku` | Trim; required and non-empty; never invent a value |
+| `lines[].qty` | `line_items[].quantity` | Integer |
+| `lines[].unit_price` | `line_items[].price` | Preserve the string exactly; never convert through float |
+| `lines` | `line_items` | Must be a non-empty list |
+
+Null, missing, and empty strings are not usable mapping values. `total_price`, `subtotal_price`, tax, discounts, shipping, gift cards, `name`, `order_number`, and all other Shopify fields are ignored. The gateway computes the total from line items, so Shopify's totals do not affect the stored order. SKU is required. This module supports one store and only the `orders/create` topic.
+
+### Live test (manual)
+
+- Create a free Shopify development store.
+- Create a webhook subscription for `orders/create` pointing to a public tunnel URL ending in `/webhooks/shopify/orders-create`.
+- Confirm in current Shopify docs which signing secret applies to the method used to create the webhook, then set that secret as `SHOPIFY_WEBHOOK_SECRET`.
+- Place a test order and confirm one gateway order reaches `CONFIRMED`.
+- Resend the same webhook from Shopify and confirm the gateway still has one order for that webhook ID.
