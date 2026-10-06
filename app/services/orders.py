@@ -8,7 +8,7 @@ from pydantic import ValidationError
 from sqlalchemy import text
 
 from app.core.schemas import OrderInput
-from app.db.models import AuditEvent, IdempotencyKey, Order, OrderLine
+from app.db.models import AuditEvent, IdempotencyKey, Job, Order, OrderLine
 from app.db.session import SessionLocal
 
 logger = logging.getLogger(__name__)
@@ -137,6 +137,9 @@ def submit_order(raw_body: bytes, idempotency_key: str) -> tuple[int, dict]:
         db.add(order)
         db.flush()
         db.add(AuditEvent(order_id=order.order_id, event_type="order.received", details={}))
+        db.flush()
+        db.add(Job(order_id=order.order_id, status="QUEUED", attempts=0))
+        db.add(AuditEvent(order_id=order.order_id, event_type="order.queued", details={}))
         db.flush()
         response_body = serialize_order(order)
         db.add(IdempotencyKey(key=idempotency_key, request_hash=digest, response_json=response_body,

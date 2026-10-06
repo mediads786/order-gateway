@@ -1,12 +1,18 @@
 from concurrent.futures import ThreadPoolExecutor
 import json
 from threading import Barrier
+import uuid
 
-from sqlalchemy import func, select
+import httpx
+import pytest
+from sqlalchemy import event, func, select, text
 
-from app.db.models import IdempotencyKey, Order
+from app.db.models import AuditEvent, IdempotencyKey, Job, Order
 from app.db.session import SessionLocal
 from app.services.orders import submit_order
+from app.workers.worker import claim_next_job, process_one, run_until_idle
+
+ERP_URL = "http://127.0.0.1:9001"
 
 
 def valid_payload():
@@ -27,6 +33,10 @@ def test_valid_order_returns_201_and_computed_total(client):
     assert result.status_code == 201
     assert result.json()["total"] == "26.25"
     assert result.json()["status"] == "RECEIVED"
+    with SessionLocal() as db:
+        job = db.scalar(select(Job).where(Job.order_id == result.json()["order_id"]))
+        assert job is not None
+        assert job.status == "QUEUED"
 
 
 def test_same_key_and_body_returns_original_without_new_order(client):
@@ -75,6 +85,7 @@ def test_invalid_orders_are_rejected_and_stored(client):
         assert rejected is not None
         assert rejected.customer_phone is None
         assert rejected.customer_email is None
+        assert db.scalar(select(func.count()).select_from(Job)) == 0
 
 
 def test_ten_parallel_service_calls_with_same_key_create_one_order():
@@ -112,8 +123,6 @@ def test_missing_idempotency_key_is_400(client):
 
 def test_health_and_unknown_order(client):
     assert client.get("/health").status_code == 200
-    import uuid
-
     assert client.get(f"/orders/{uuid.uuid4()}").status_code == 404
 
 
@@ -179,3 +188,168 @@ def test_rejected_replay_keeps_422_and_same_body(client):
     with SessionLocal() as db:
         saved_status = db.scalar(select(IdempotencyKey.status_code).where(IdempotencyKey.key == "replay-rejected"))
         assert saved_status == 422
+
+
+def test_worker_confirms_order_and_writes_events_in_order(client):
+    response = client.post("/orders", json=valid_payload(), headers={"Idempotency-Key": "worker-success"})
+    assert response.status_code == 201
+    order_id = uuid.UUID(response.json()["order_id"])
+    assert response.json()["status"] == "RECEIVED"
+    assert process_one() is True
+    with SessionLocal() as db:
+        order = db.get(Order, order_id)
+        job = db.scalar(select(Job).where(Job.order_id == order_id))
+        events = db.scalars(select(AuditEvent).where(AuditEvent.order_id == order_id).order_by(AuditEvent.event_id)).all()
+        assert order.status == "CONFIRMED"
+        assert order.erp_order_id
+        assert job.status == "DONE"
+        assert [event.event_type for event in events] == [
+            "order.received", "order.queued", "order.processing", "order.confirmed"
+        ]
+
+
+def test_two_workers_process_twenty_orders_once(client):
+    for index in range(20):
+        payload = valid_payload()
+        payload["external_ref"] = f"batch-{index}"
+        response = client.post("/orders", json=payload, headers={"Idempotency-Key": f"batch-{index}"})
+        assert response.status_code == 201
+
+    barrier = Barrier(2)
+
+    def drain_together():
+        barrier.wait(timeout=10)
+        return run_until_idle()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda _: drain_together(), range(2)))
+
+    with SessionLocal() as db:
+        jobs = db.scalars(select(Job)).all()
+        assert len(jobs) == 20
+        assert all(job.status == "DONE" and job.attempts == 1 for job in jobs)
+        assert all(job.attempts == 1 for job in jobs)
+        assert len({job.order_id for job in jobs}) == 20
+        order_count = db.scalar(select(func.count()).select_from(Order))
+        processing_counts = db.execute(
+            select(AuditEvent.order_id, func.count())
+            .where(AuditEvent.event_type == "order.processing")
+            .group_by(AuditEvent.order_id)
+        ).all()
+        assert order_count == 20
+        assert len(processing_counts) == 20
+        assert all(count == 1 for _, count in processing_counts)
+    erp_orders = httpx.get(f"{ERP_URL}/sales-orders", timeout=3).json()
+    assert len(erp_orders) == 20
+    assert len({order["external_id"] for order in erp_orders}) == 20
+
+
+def test_skip_locked_claims_distinct_jobs_in_separate_transactions():
+    seeded_job_ids = []
+    for index in range(2):
+        payload = valid_payload()
+        payload["external_ref"] = f"skip-locked-{index}"
+        status, body = submit_order(json.dumps(payload).encode(), f"skip-locked-{index}")
+        assert status == 201
+        seeded_job_ids.append(uuid.UUID(body["order_id"]))
+
+    session_a = SessionLocal()
+    session_b = SessionLocal()
+    try:
+        claimed_a = claim_next_job(session_a)
+        assert claimed_a is not None
+
+        session_b.execute(text("SET LOCAL lock_timeout = '1s'"))
+        claimed_b = claim_next_job(session_b)
+        assert claimed_b is None or claimed_b.job_id != claimed_a.job_id
+
+        session_a.commit()
+        session_b.commit()
+
+        claimed_ids = {claimed_a.job_id}
+        if claimed_b is not None:
+            claimed_ids.add(claimed_b.job_id)
+        if claimed_b is None:
+            with SessionLocal.begin() as session_c:
+                claimed_c = claim_next_job(session_c)
+                assert claimed_c is not None
+                claimed_ids.add(claimed_c.job_id)
+
+        assert len(claimed_ids) == 2
+    finally:
+        session_a.close()
+        session_b.close()
+
+    with SessionLocal() as db:
+        jobs = db.scalars(select(Job).where(Job.order_id.in_(seeded_job_ids))).all()
+        assert len(jobs) == 2
+        assert all(job.status == "PROCESSING" and job.attempts == 1 for job in jobs)
+        processing_counts = db.execute(
+            select(AuditEvent.order_id, func.count())
+            .where(AuditEvent.order_id.in_(seeded_job_ids), AuditEvent.event_type == "order.processing")
+            .group_by(AuditEvent.order_id)
+        ).all()
+        assert len(processing_counts) == 2
+        assert all(count == 1 for _, count in processing_counts)
+
+
+def test_worker_failure_marks_order_failed_dead(client):
+    fault = httpx.post(f"{ERP_URL}/admin/faults", json={"mode": "error_500"}, timeout=3)
+    assert fault.status_code == 200
+    response = client.post("/orders", json=valid_payload(), headers={"Idempotency-Key": "worker-failure"})
+    order_id = uuid.UUID(response.json()["order_id"])
+    assert process_one() is True
+    with SessionLocal() as db:
+        order = db.get(Order, order_id)
+        job = db.scalar(select(Job).where(Job.order_id == order_id))
+        assert order.status == "FAILED_DEAD"
+        assert job.status == "FAILED"
+        assert job.attempts == 1
+        assert job.last_error
+
+
+def test_mock_erp_deduplicates_external_id():
+    order = {
+        "external_id": "same-external-id",
+        "customer": {"name": "Ada", "email": "ada@example.com"},
+        "currency": "USD",
+        "lines": [{"sku": "BOOK", "qty": 1, "unit_price": "12.50"}],
+        "total": "12.50",
+    }
+    first = httpx.post(f"{ERP_URL}/sales-orders", json=order, timeout=3)
+    second = httpx.post(f"{ERP_URL}/sales-orders", json=order, timeout=3)
+    assert first.status_code == 201
+    assert second.status_code == 200
+    assert second.json()["erp_order_id"] == first.json()["erp_order_id"]
+    assert len(httpx.get(f"{ERP_URL}/sales-orders", timeout=3).json()) == 1
+
+
+def test_rejected_order_creates_no_job(client):
+    payload = valid_payload()
+    payload["lines"] = []
+    response = client.post("/orders", json=payload, headers={"Idempotency-Key": "rejected-no-job"})
+    assert response.status_code == 422
+    with SessionLocal() as db:
+        assert db.scalar(select(func.count()).select_from(Job)) == 0
+
+
+def test_order_and_job_rollback_if_transaction_fails_after_order_insert():
+    class InjectedFailure(RuntimeError):
+        pass
+
+    def fail_after_order_insert(session, flush_context):
+        if any(isinstance(item, Order) for item in session.new):
+            raise InjectedFailure("failure after order insert")
+
+    raw_body = json.dumps(valid_payload()).encode()
+    event.listen(SessionLocal.class_, "after_flush", fail_after_order_insert)
+    try:
+        with pytest.raises(InjectedFailure, match="failure after order insert"):
+            submit_order(raw_body, "atomic-failure")
+    finally:
+        event.remove(SessionLocal.class_, "after_flush", fail_after_order_insert)
+
+    with SessionLocal() as db:
+        assert db.scalar(select(func.count()).select_from(Order)) == 0
+        assert db.scalar(select(func.count()).select_from(Job)) == 0
+        assert db.scalar(select(func.count()).select_from(IdempotencyKey)) == 0

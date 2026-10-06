@@ -1,6 +1,6 @@
-# Order Gateway — Module 1: Intake and Storage
+# Order Gateway — Modules 1–2: Intake, Queue, Worker, and Mock ERP
 
-Accepts canonical orders, computes totals with `Decimal`, stores raw and canonical data, enforces idempotency, and records received/rejected audit events. This module has no queue or ERP integration.
+Accepts canonical orders, computes totals with `Decimal`, stores raw and canonical data, enforces idempotency, and records audit events. Valid orders atomically receive a queued job; a separate worker sends them to the in-memory mock ERP.
 
 ## Requirements
 
@@ -16,14 +16,13 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 Copy-Item .env.example .env
-$env:TEST_DATABASE_URL = "postgresql+psycopg://order_gateway:order_gateway@127.0.0.1:5433/order_gateway_test"
 docker compose up -d --build
-pytest
+.\.venv\Scripts\python.exe -m pytest -v
 ```
 
-`docker compose up -d --build` starts PostgreSQL and the API at `http://localhost:8001`; the API applies the Alembic migration on startup. Tests require `TEST_DATABASE_URL` to point to a dedicated PostgreSQL database whose name ends in `_test`. The test setup creates that database if missing, forces `DATABASE_URL` to it before importing the app, and clears its tables before each test. It exits before importing the app if the database name does not end in `_test`.
+Compose starts PostgreSQL, the API, mock ERP, and the worker. The API is available at `http://127.0.0.1:8002`; the mock ERP is at `http://127.0.0.1:9001`. The API applies Alembic migrations at startup, and Compose waits for the API migration and mock ERP before starting the worker. Tests read `TEST_DATABASE_URL` from the environment or `.env`; the test setup creates that database if missing, forces `DATABASE_URL` to it before importing the app, and clears its tables before each test. It exits before importing the app if the database name does not end in `_test`.
 
-API is available at `http://localhost:8000`; health check: `GET /health`.
+Set `ERP_BASE_URL`, `ERP_TIMEOUT_SECONDS`, and `WORKER_POLL_INTERVAL_SECONDS` in `.env` for the worker. The example values target the Compose mock ERP, use a 5-second ERP timeout, and poll once per second.
 
 ## Request example
 
@@ -41,4 +40,14 @@ Prices must be JSON strings, such as `"12.50"`. JSON numeric prices are rejected
 
 Send it to `POST /orders` with an `Idempotency-Key` header. The server returns `201` for a new valid order, `200` for a repeated identical request, `409` for reuse with a different body, `422` for a stored rejected order, and `400` when the key is missing. `GET /orders/{order_id}` returns the order with its audit events.
 
-The API reads `DATABASE_URL`. Tests use `TEST_DATABASE_URL`, shown in `.env.example`, and never connect to the `order_gateway` database.
+The API and worker read `DATABASE_URL`. Tests use `TEST_DATABASE_URL`, shown in `.env.example`, and never connect to the `order_gateway` database.
+
+## Mock ERP
+
+- `POST /sales-orders` creates an ERP order once per `external_id` and returns the same ERP ID for duplicates.
+- `GET /sales-orders` lists records; `GET /sales-orders/{erp_order_id}` returns one record.
+- `POST /admin/faults` accepts `none`, `error_500`, `rate_limit_429`, `timeout`, or `slow`; `POST /admin/reset` clears its in-memory records and fault setting.
+
+## Worker crash gap
+
+A worker that crashes after claiming a job leaves it in `PROCESSING`. Recovery of stuck jobs is intentionally deferred to Module 3.
