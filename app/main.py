@@ -3,9 +3,9 @@ from datetime import timezone
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from starlette.concurrency import run_in_threadpool
-from sqlalchemy import select
+from sqlalchemy import func, select
 
-from app.db.models import Order
+from app.db.models import AuditEvent, Job, Order
 from app.db.session import SessionLocal
 from app.services.orders import serialize_order, submit_order
 app = FastAPI()
@@ -32,6 +32,29 @@ def get_order(order_id: uuid.UUID):
                                    "created_at": event.created_at.astimezone(timezone.utc).isoformat()}
                                   for event in order.events]
         return result
+
+
+@app.post("/orders/{order_id}/retry")
+def retry_order(order_id: uuid.UUID):
+    with SessionLocal.begin() as db:
+        order = db.get(Order, order_id)
+        if order is None:
+            raise HTTPException(status_code=404, detail="Order not found")
+        job = db.scalar(select(Job).where(Job.order_id == order_id).with_for_update())
+        if job is None:
+            raise HTTPException(status_code=409, detail="Order has no retryable job")
+        db.refresh(order)
+        if order.status != "FAILED_DEAD" or job.status != "FAILED":
+            raise HTTPException(status_code=409, detail="Order is not failed dead")
+        previous_attempts = job.attempts
+        job.status = "QUEUED"
+        job.attempts = 0
+        job.next_attempt_at = func.now()
+        job.locked_at = None
+        job.updated_at = func.now()
+        order.status = "QUEUED"
+        db.add(AuditEvent(order_id=order_id, event_type="order.requeued", details={"previous_attempts": previous_attempts}))
+    return {"order_id": str(order_id), "status": "QUEUED"}
 
 
 @app.get("/health")

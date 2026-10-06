@@ -1,5 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 import json
+import time
 from threading import Barrier
 import uuid
 
@@ -10,6 +12,7 @@ from sqlalchemy import event, func, select, text
 from app.db.models import AuditEvent, IdempotencyKey, Job, Order
 from app.db.session import SessionLocal
 from app.services.orders import submit_order
+from app.workers import worker
 from app.workers.worker import claim_next_job, process_one, run_until_idle
 
 ERP_URL = "http://127.0.0.1:9001"
@@ -206,6 +209,8 @@ def test_worker_confirms_order_and_writes_events_in_order(client):
         assert [event.event_type for event in events] == [
             "order.received", "order.queued", "order.processing", "order.confirmed"
         ]
+        assert events[2].details == {"attempt": 1}
+        assert events[3].details == {"erp_order_id": order.erp_order_id, "attempt": 1}
 
 
 def test_two_workers_process_twenty_orders_once(client):
@@ -239,6 +244,8 @@ def test_two_workers_process_twenty_orders_once(client):
         assert order_count == 20
         assert len(processing_counts) == 20
         assert all(count == 1 for _, count in processing_counts)
+        processing_events = db.scalars(select(AuditEvent).where(AuditEvent.event_type == "order.processing")).all()
+        assert all(event.details == {"attempt": 1} for event in processing_events)
     erp_orders = httpx.get(f"{ERP_URL}/sales-orders", timeout=3).json()
     assert len(erp_orders) == 20
     assert len({order["external_id"] for order in erp_orders}) == 20
@@ -293,7 +300,8 @@ def test_skip_locked_claims_distinct_jobs_in_separate_transactions():
         assert all(count == 1 for _, count in processing_counts)
 
 
-def test_worker_failure_marks_order_failed_dead(client):
+def test_worker_failure_marks_order_failed_dead(client, monkeypatch):
+    monkeypatch.setattr(worker, "MAX_ATTEMPTS", 1)
     fault = httpx.post(f"{ERP_URL}/admin/faults", json={"mode": "error_500"}, timeout=3)
     assert fault.status_code == 200
     response = client.post("/orders", json=valid_payload(), headers={"Idempotency-Key": "worker-failure"})
@@ -306,6 +314,242 @@ def test_worker_failure_marks_order_failed_dead(client):
         assert job.status == "FAILED"
         assert job.attempts == 1
         assert job.last_error
+        failed = db.scalar(select(AuditEvent).where(
+            AuditEvent.order_id == order_id, AuditEvent.event_type == "order.failed",
+        ))
+        assert failed.details == {"attempt": 1, "error": job.last_error, "reason": "max_attempts"}
+
+
+def _make_job_due(order_id):
+    with SessionLocal.begin() as db:
+        job = db.scalar(select(Job).where(Job.order_id == order_id))
+        job.next_attempt_at = datetime.now(timezone.utc) - timedelta(seconds=2)
+
+
+def _submit_one(client, key):
+    response = client.post("/orders", json=valid_payload(), headers={"Idempotency-Key": key})
+    assert response.status_code == 201
+    return uuid.UUID(response.json()["order_id"])
+
+
+@pytest.mark.parametrize("attempt,base,cap,random_value,expected", [
+    (1, 2, 20, 0, 1), (2, 2, 20, 0, 2), (3, 2, 20, 0, 4),
+    (8, 2, 5, 1, 5), (2, 2, 20, 1, 4),
+])
+def test_backoff_bounds_and_growth(attempt, base, cap, random_value, expected):
+    assert worker.compute_backoff(attempt, base, cap, lambda: random_value) == expected
+
+
+@pytest.mark.parametrize("status,retryable,reason", [
+    (500, True, "http_500"), (502, True, "http_502"), (429, True, "http_429"),
+    (400, False, "non_retryable"), (404, False, "non_retryable"), (422, False, "non_retryable"),
+])
+def test_failure_classification_http_status(status, retryable, reason):
+    assert worker.classify_failure(status_code=status) == (retryable, reason)
+
+
+@pytest.mark.parametrize("exc", [
+    httpx.TimeoutException("timeout"), httpx.ConnectError("connect"),
+    httpx.ReadError("read"), httpx.RemoteProtocolError("remote protocol"),
+])
+def test_failure_classification_transport_errors(exc):
+    assert worker.classify_failure(error=exc) == (True, type(exc).__name__)
+
+
+def test_failure_classification_malformed_success_response():
+    assert worker.classify_failure(status_code=200, invalid_response=True) == (True, "invalid_response")
+
+
+@pytest.mark.parametrize("mode", ["error_500", "rate_limit_429", "timeout"])
+def test_temporary_erp_failures_retry_then_succeed(client, monkeypatch, mode):
+    if mode == "timeout":
+        monkeypatch.setattr(worker, "ERP_TIMEOUT_SECONDS", 0.05)
+    httpx.post(f"{ERP_URL}/admin/faults", json={"mode": mode}, timeout=3)
+    order_id = _submit_one(client, f"retry-{mode}")
+    assert process_one() is True
+    with SessionLocal() as db:
+        job = db.scalar(select(Job).where(Job.order_id == order_id))
+        order = db.get(Order, order_id)
+        assert job.status == "QUEUED"
+        assert job.attempts == 1
+        assert job.last_error
+        assert job.next_attempt_at > datetime.now(timezone.utc)
+        assert order.status == "RETRYING"
+        retry_event = db.scalar(select(AuditEvent).where(
+            AuditEvent.order_id == order_id, AuditEvent.event_type == "order.retrying",
+        ))
+        assert set(retry_event.details) == {"attempt", "error", "retry_in_seconds", "next_attempt_at"}
+        assert retry_event.details["attempt"] == 1
+        assert retry_event.details["error"] == job.last_error
+        assert retry_event.details["retry_in_seconds"] > 0
+        assert retry_event.details["next_attempt_at"].endswith("Z")
+        assert datetime.fromisoformat(retry_event.details["next_attempt_at"].replace("Z", "+00:00")) == job.next_attempt_at
+    httpx.post(f"{ERP_URL}/admin/faults", json={"mode": "none"}, timeout=3)
+    _make_job_due(order_id)
+    assert process_one() is True
+    with SessionLocal() as db:
+        job = db.scalar(select(Job).where(Job.order_id == order_id))
+        assert job.status == "DONE"
+        assert db.get(Order, order_id).status == "CONFIRMED"
+        processing = db.scalars(select(AuditEvent).where(
+            AuditEvent.order_id == order_id, AuditEvent.event_type == "order.processing",
+        ).order_by(AuditEvent.event_id)).all()
+        assert [event.details for event in processing] == [{"attempt": 1}, {"attempt": 2}]
+        confirmed = db.scalar(select(AuditEvent).where(
+            AuditEvent.order_id == order_id, AuditEvent.event_type == "order.confirmed",
+        ))
+        assert confirmed.details == {"erp_order_id": db.get(Order, order_id).erp_order_id, "attempt": 2}
+
+
+def test_permanent_erp_422_does_not_retry(client):
+    httpx.post(f"{ERP_URL}/admin/faults", json={"mode": "error_422"}, timeout=3)
+    order_id = _submit_one(client, "erp-422-permanent")
+    assert process_one()
+    with SessionLocal() as db:
+        job = db.scalar(select(Job).where(Job.order_id == order_id))
+        assert job.status == "FAILED"
+        assert job.attempts == 1
+        assert db.get(Order, order_id).status == "FAILED_DEAD"
+        events = db.scalars(select(AuditEvent).where(AuditEvent.order_id == order_id)).all()
+        assert sum(event.event_type == "order.retrying" for event in events) == 0
+        failed = next(event for event in events if event.event_type == "order.failed")
+        assert failed.details == {"attempt": 1, "error": job.last_error, "reason": "non_retryable"}
+
+
+def test_attempt_limit_moves_retryable_job_to_dead_letter(client, monkeypatch):
+    monkeypatch.setattr(worker, "MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(worker, "RETRY_BASE_SECONDS", 0)
+    monkeypatch.setattr(worker, "RETRY_MAX_SECONDS", 0)
+    httpx.post(f"{ERP_URL}/admin/faults", json={"mode": "error_500"}, timeout=3)
+    order_id = _submit_one(client, "retry-exhausted")
+    for attempt in range(3):
+        assert process_one()
+        if attempt < 2:
+            _make_job_due(order_id)
+    with SessionLocal() as db:
+        job = db.scalar(select(Job).where(Job.order_id == order_id))
+        assert job.status == "FAILED" and job.attempts == 3
+        assert db.get(Order, order_id).status == "FAILED_DEAD"
+        events = db.scalars(select(AuditEvent).where(AuditEvent.order_id == order_id)).all()
+        assert sum(event.event_type == "order.retrying" for event in events) == 2
+        assert sum(event.event_type == "order.failed" for event in events) == 1
+        assert sum(event.event_type == "order.processing" for event in events) == 3
+        processing = [event.details for event in events if event.event_type == "order.processing"]
+        assert processing == [{"attempt": 1}, {"attempt": 2}, {"attempt": 3}]
+        retrying = [event for event in events if event.event_type == "order.retrying"]
+        assert [event.details["attempt"] for event in retrying] == [1, 2]
+        assert all(set(event.details) == {"attempt", "error", "retry_in_seconds", "next_attempt_at"} for event in retrying)
+        failed = next(event for event in events if event.event_type == "order.failed")
+        assert failed.details == {"attempt": 3, "error": job.last_error, "reason": "max_attempts"}
+
+
+def test_claim_skips_job_whose_retry_time_is_in_future(client):
+    order_id = _submit_one(client, "future-retry")
+    with SessionLocal.begin() as db:
+        job = db.scalar(select(Job).where(Job.order_id == order_id))
+        job.next_attempt_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+    with SessionLocal.begin() as db:
+        assert claim_next_job(db) is None
+
+
+def test_manual_retry_requeues_dead_job_and_worker_confirms(client):
+    httpx.post(f"{ERP_URL}/admin/faults", json={"mode": "error_422"}, timeout=3)
+    order_id = _submit_one(client, "manual-retry")
+    assert process_one()
+    httpx.post(f"{ERP_URL}/admin/faults", json={"mode": "none"}, timeout=3)
+    result = client.post(f"/orders/{order_id}/retry")
+    assert result.status_code == 200
+    assert result.json() == {"order_id": str(order_id), "status": "QUEUED"}
+    assert process_one()
+    with SessionLocal() as db:
+        assert db.get(Order, order_id).status == "CONFIRMED"
+        job = db.scalar(select(Job).where(Job.order_id == order_id))
+        assert job.status == "DONE" and job.attempts == 1
+        requeued = db.scalar(select(AuditEvent).where(
+            AuditEvent.order_id == order_id, AuditEvent.event_type == "order.requeued",
+        ))
+        assert requeued.details == {"previous_attempts": 1}
+
+
+def test_manual_retry_rejects_non_dead_and_unknown_orders(client):
+    order_id = _submit_one(client, "manual-retry-not-dead")
+    assert client.post(f"/orders/{order_id}/retry").status_code == 409
+    assert client.post(f"/orders/{uuid.uuid4()}/retry").status_code == 404
+
+
+def test_simultaneous_manual_retries_only_requeue_once(client):
+    httpx.post(f"{ERP_URL}/admin/faults", json={"mode": "error_422"}, timeout=3)
+    order_id = _submit_one(client, "manual-retry-race")
+    assert process_one()
+    barrier = Barrier(2)
+
+    def retry_together(_):
+        barrier.wait(timeout=10)
+        return client.post(f"/orders/{order_id}/retry").status_code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        statuses = list(pool.map(retry_together, range(2)))
+    assert sorted(statuses) == [200, 409]
+    with SessionLocal() as db:
+        assert db.scalar(select(Job).where(Job.order_id == order_id)).status == "QUEUED"
+        requeued_events = db.scalars(select(AuditEvent).where(
+            AuditEvent.order_id == order_id, AuditEvent.event_type == "order.requeued",
+        )).all()
+        assert len(requeued_events) == 1
+        assert requeued_events[0].details == {"previous_attempts": 1}
+
+
+def test_stale_jobs_are_recovered_or_dead_lettered(client, monkeypatch):
+    monkeypatch.setattr(worker, "MAX_ATTEMPTS", 3)
+    retry_id = _submit_one(client, "stale-retry")
+    dead_id = _submit_one(client, "stale-dead")
+    fresh_id = _submit_one(client, "stale-fresh")
+    with SessionLocal.begin() as db:
+        retry_job = db.scalar(select(Job).where(Job.order_id == retry_id))
+        dead_job = db.scalar(select(Job).where(Job.order_id == dead_id))
+        fresh_job = db.scalar(select(Job).where(Job.order_id == fresh_id))
+        for job, attempts in ((retry_job, 1), (dead_job, 3)):
+            job.status = "PROCESSING"
+            job.attempts = attempts
+            job.locked_at = datetime.now(timezone.utc) - timedelta(hours=1)
+        db.get(Order, retry_id).status = "PROCESSING"
+        db.get(Order, dead_id).status = "PROCESSING"
+        fresh_job.status = "PROCESSING"
+        fresh_job.attempts = 1
+        fresh_job.locked_at = datetime.now(timezone.utc)
+        db.get(Order, fresh_id).status = "PROCESSING"
+    assert worker.recover_stale_jobs() == 2
+    with SessionLocal() as db:
+        assert db.scalar(select(Job).where(Job.order_id == retry_id)).status == "QUEUED"
+        assert db.get(Order, retry_id).status == "RETRYING"
+        assert db.scalar(select(Job).where(Job.order_id == dead_id)).status == "FAILED"
+        assert db.get(Order, dead_id).status == "FAILED_DEAD"
+        assert db.scalar(select(Job).where(Job.order_id == fresh_id)).status == "PROCESSING"
+        assert db.get(Order, fresh_id).status == "PROCESSING"
+        retry_events = db.scalars(select(AuditEvent).where(AuditEvent.order_id == retry_id)).all()
+        dead_events = db.scalars(select(AuditEvent).where(AuditEvent.order_id == dead_id)).all()
+        recovered = next(event for event in retry_events if event.event_type == "order.recovered_stale")
+        assert recovered.details == {"attempt": 1}
+        failed = next(event for event in dead_events if event.event_type == "order.failed")
+        assert failed.details == {"attempt": 3, "error": "worker_lost", "reason": "worker_lost"}
+
+
+def test_mock_erp_configurable_faults_and_reset():
+    httpx.post(f"{ERP_URL}/admin/reset", timeout=3)
+    payload = {"external_id": "fault-config", "customer": {"name": "Ada"}, "currency": "USD",
+               "lines": [{"sku": "X", "qty": 1, "unit_price": "1.00"}], "total": "1.00"}
+    configured = httpx.post(f"{ERP_URL}/admin/faults", json={"mode": "none", "fail_rate": 1, "latency_ms": 0}, timeout=3)
+    assert configured.status_code == 200
+    assert httpx.post(f"{ERP_URL}/sales-orders", json=payload, timeout=3).status_code == 500
+    httpx.post(f"{ERP_URL}/admin/faults", json={"mode": "none", "fail_rate": 0, "latency_ms": 150}, timeout=3)
+    started = time.monotonic()
+    created = httpx.post(f"{ERP_URL}/sales-orders", json=payload, timeout=3)
+    elapsed = time.monotonic() - started
+    assert created.status_code == 201
+    assert elapsed >= 0.15
+    httpx.post(f"{ERP_URL}/admin/reset", timeout=3)
+    assert httpx.get(f"{ERP_URL}/sales-orders", timeout=3).json() == []
+    assert httpx.post(f"{ERP_URL}/sales-orders", json=payload, timeout=3).status_code == 201
 
 
 def test_mock_erp_deduplicates_external_id():
@@ -319,9 +563,39 @@ def test_mock_erp_deduplicates_external_id():
     first = httpx.post(f"{ERP_URL}/sales-orders", json=order, timeout=3)
     second = httpx.post(f"{ERP_URL}/sales-orders", json=order, timeout=3)
     assert first.status_code == 201
-    assert second.status_code == 200
+    assert second.status_code == 409
     assert second.json()["erp_order_id"] == first.json()["erp_order_id"]
     assert len(httpx.get(f"{ERP_URL}/sales-orders", timeout=3).json()) == 1
+
+
+def test_duplicate_on_retry_confirms_with_existing_erp_order(client):
+    order_id = _submit_one(client, "duplicate-on-retry")
+    external_id = str(order_id)
+    mock_order = {
+        "external_id": external_id,
+        "customer": {"name": "Ada", "email": "ada@example.com"},
+        "currency": "USD",
+        "lines": [{"sku": "BOOK", "qty": 1, "unit_price": "12.50"}],
+        "total": "12.50",
+    }
+    created = httpx.post(f"{ERP_URL}/sales-orders", json=mock_order, timeout=3)
+    assert created.status_code == 201
+    existing_erp_order_id = created.json()["erp_order_id"]
+
+    assert process_one() is True
+
+    with SessionLocal() as db:
+        order = db.get(Order, order_id)
+        job = db.scalar(select(Job).where(Job.order_id == order_id))
+        events = db.scalars(select(AuditEvent).where(AuditEvent.order_id == order_id)).all()
+        assert order.status == "CONFIRMED"
+        assert order.erp_order_id == existing_erp_order_id
+        assert job.status == "DONE"
+        confirmed = next(event for event in events if event.event_type == "order.confirmed")
+        assert confirmed.details == {"erp_order_id": existing_erp_order_id, "attempt": 1}
+    matching_orders = [row for row in httpx.get(f"{ERP_URL}/sales-orders", timeout=3).json()
+                       if row["external_id"] == external_id]
+    assert len(matching_orders) == 1
 
 
 def test_rejected_order_creates_no_job(client):

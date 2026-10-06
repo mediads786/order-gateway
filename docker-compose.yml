@@ -46,6 +46,10 @@ services:
       ERP_BASE_URL: http://mock_erp:9001
       ERP_TIMEOUT_SECONDS: ${ERP_TIMEOUT_SECONDS:-5}
       WORKER_POLL_INTERVAL_SECONDS: ${WORKER_POLL_INTERVAL_SECONDS:-1}
+      RETRY_BASE_SECONDS: ${RETRY_BASE_SECONDS:-2}
+      RETRY_MAX_SECONDS: ${RETRY_MAX_SECONDS:-60}
+      MAX_ATTEMPTS: ${MAX_ATTEMPTS:-5}
+      STALE_JOB_SECONDS: ${STALE_JOB_SECONDS:-120}
     depends_on:
       db:
         condition: service_healthy
