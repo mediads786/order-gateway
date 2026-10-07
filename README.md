@@ -1,106 +1,162 @@
-# Order Gateway — Modules 1–3B: Intake, Queue, Worker, Retries, Shopify, and Mock ERP
+# Order Gateway
 
-Accepts canonical orders, computes totals with `Decimal`, stores raw and canonical data, enforces idempotency, and records audit events. Valid orders atomically receive a queued job; a separate worker sends them to the in-memory mock ERP.
+An idempotent order intake and delivery service that stores orders in PostgreSQL, retries ERP delivery, and provides an operations view.
 
-## Requirements
+<!-- TODO: add demo.gif after recording -->
 
-- Python 3.12
-- Docker Compose
+## What it does
 
-## Run
+- Delivers orders reliably to an ERP through a worker.
+- Accepts idempotent canonical orders and Shopify `orders/create` webhooks.
+- Retries temporary ERP failures and records exhausted jobs as dead letters.
+- Keeps an append-only audit trail for orders and shipments.
+- Supports a mock ERP by default, an Odoo 19 adapter, and signed shipment adjustments.
 
-From the project root, create a virtual environment and install the pinned dependencies:
+## Architecture
+
+```mermaid
+flowchart LR
+  subgraph Sources
+    W[Web / manual<br/>POST /orders]
+    S[Shopify webhook<br/>HMAC verified]
+    SH[Shipment event<br/>POST /shipments, HMAC]
+  end
+  subgraph Gateway
+    API[FastAPI intake<br/>validate + idempotency]
+    PG[(PostgreSQL<br/>orders, jobs, audit)]
+    WK[Worker<br/>SKIP LOCKED, retries, dead letters]
+    AD[Adapter interface]
+    UI[Admin pages<br/>/admin]
+  end
+  subgraph ERP side
+    M[Mock ERP<br/>fault injection]
+    O[Odoo 19 JSON-2]
+  end
+  W --> API
+  S --> API
+  SH --> API
+  API --> PG
+  PG --> WK
+  WK --> AD
+  AD --> M
+  AD --> O
+  SH -. stock adjustment .-> O
+  UI --> PG
+```
+
+The API validates and stores orders and idempotency records in one PostgreSQL transaction. Valid orders create a queued job and audit event atomically. A separate worker claims jobs with `FOR UPDATE SKIP LOCKED`, calls the configured ERP adapter, and records retry or completion events. Shopify orders are authenticated from their original request bytes before mapping. Shipment requests are signed and applied synchronously through the Odoo adapter. The server-rendered admin pages read the same order, job, shipment, and audit tables.
+
+```mermaid
+stateDiagram-v2
+  [*] --> RECEIVED: valid intake
+  [*] --> REJECTED: invalid intake
+  RECEIVED --> QUEUED: job created
+  QUEUED --> PROCESSING: worker claim
+  PROCESSING --> CONFIRMED: ERP success
+  PROCESSING --> RETRYING: temporary failure
+  RETRYING --> QUEUED: retry due
+  PROCESSING --> FAILED_DEAD: permanent failure or attempts exhausted
+  FAILED_DEAD --> QUEUED: manual retry
+```
+
+## Quickstart (10 minutes)
+
+Prerequisites: Docker Desktop, Git, PowerShell, and about 2 GB of RAM for the default demo.
+
+From a fresh clone, run these commands in the repository root. Create a 32-character token using the shown PowerShell expression, then paste it into `.env` as `ADMIN_TOKEN` before starting Compose.
+
+```powershell
+Copy-Item .env.example .env
+notepad .env
+docker compose up -d --build
+```
+
+Token generator:
+
+```powershell
+-join ((48..57) + (97..122) | Get-Random -Count 32 | ForEach-Object { [char]$_ })
+```
+
+The API is at `http://localhost:8002`; open the admin page at `http://localhost:8002/admin`, API docs at `http://localhost:8002/docs`, and health at `http://localhost:8002/health`. The API container runs `alembic upgrade head` before Uvicorn starts; the worker waits for the API healthcheck. Sign in with the `ADMIN_TOKEN` value.
+
+Send a first order from PowerShell:
+
+```powershell
+$body = '{"source":"manual","external_ref":"quickstart-1","customer":{"name":"Ada","email":"ada@example.com"},"currency":"USD","lines":[{"sku":"BOOK","qty":2,"unit_price":"19.99"}]}'
+$key = [guid]::NewGuid().ToString()
+Invoke-RestMethod -Method Post -Uri http://localhost:8002/orders -Headers @{"Idempotency-Key"=$key} -ContentType "application/json" -Body $body
+```
+
+Prices must be JSON strings. Numeric prices are rejected by design to avoid converting binary floats into money.
+
+To run the real-PostgreSQL tests from the host, create the local environment and install the pinned test dependencies:
 
 ```powershell
 py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-Copy-Item .env.example .env
-$env:SHOPIFY_WEBHOOK_SECRET = "replace-with-shopify-webhook-secret"
-docker compose up -d --build
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+Then run the tests after Compose is up:
+
+```powershell
 .\.venv\Scripts\python.exe -m pytest -v
 ```
 
-Compose starts PostgreSQL, the API, mock ERP, and the worker. The API is available at `http://127.0.0.1:8002`; the mock ERP is at `http://127.0.0.1:9001`. The API applies Alembic migrations at startup, and Compose waits for the API migration and mock ERP before starting the worker. Tests read `TEST_DATABASE_URL` from the environment or `.env`; the test setup creates that database if missing, forces `DATABASE_URL` to it before importing the app, and clears its tables before each test. It exits before importing the app if the database name does not end in `_test`.
+The test fixture reads `TEST_DATABASE_URL` from the environment or `.env`, creates the named test database if missing, checks that its name ends in `_test`, and sets `DATABASE_URL` to it before importing the app.
 
-Set `ERP_BASE_URL`, `ERP_TIMEOUT_SECONDS`, `WORKER_POLL_INTERVAL_SECONDS`, `RETRY_BASE_SECONDS`, `RETRY_MAX_SECONDS`, `MAX_ATTEMPTS`, and `STALE_JOB_SECONDS` in `.env` for the worker. Retry delays use capped exponential backoff with jitter. Temporary failures (5xx, 429, timeouts, and connection errors) retry until `MAX_ATTEMPTS`; other 4xx responses fail permanently. Orders awaiting a retry have status `RETRYING`. Stale worker claims are recovered after `STALE_JOB_SECONDS`.
+## Demo
 
-## Request example
+Follow the [3-minute PowerShell demo](docs/demo.md).
 
-```json
-{
-  "source": "web",
-  "external_ref": "web-123",
-  "customer": {"name": "Ada", "email": "ada@example.com"},
-  "currency": "USD",
-  "lines": [{"sku": "BOOK", "qty": 2, "unit_price": "12.50"}]
-}
+## Admin pages
+
+`/admin` provides a status-filtered order list with counts, a detail page with lines, job state, shipments and the oldest-first audit trail, and a retry button for `FAILED_DEAD` orders. The shared `ADMIN_TOKEN` is compared with a constant-time check; the browser receives a signed `gw_admin` cookie, never the token itself. Admin responses disable caching and framing and use a restrictive content security policy. State changes use POST forms, and `SameSite=Strict` cookies provide the v1 CSRF protection. `ADMIN_TOKEN` must contain at least 16 characters; otherwise all admin routes return `503 admin_disabled`.
+
+The admin has one shared identity, so an admin retry audit event cannot identify an individual, and there is no login rate limiting. The API retry endpoint remains unauthenticated in v1. Cookies are marked `Secure` only when served over HTTPS; plain local HTTP does not set that attribute.
+
+## How it works
+
+### Idempotency and retries
+
+`POST /orders` requires `Idempotency-Key`. The gateway hashes the request body and serializes concurrent same-key requests with a PostgreSQL advisory transaction lock. The same key and body replays the saved response; a different body returns `409`.
+
+The worker claims one due job using `FOR UPDATE SKIP LOCKED`, increments attempts, and calls the ERP outside the claim transaction. Retryable failures use capped exponential backoff with jitter. The defaults are at most 5 attempts, 2 seconds base, and 60 seconds cap. HTTP 429, 5xx, timeouts and transport errors retry; permanent HTTP/business errors do not. An exhausted or permanent failure marks the order `FAILED_DEAD`. Stale `PROCESSING` jobs are recovered after `STALE_JOB_SECONDS`.
+
+The audit trail includes `order.received`, `order.rejected`, `order.queued`, `order.processing`, `order.retrying`, `order.confirmed`, `order.failed`, `order.recovered_stale`, and `order.requeued`, with attempt and error details as applicable. Shipment events are `shipment.received`, `shipment.applied`, and `shipment.failed`.
+
+### Shopify webhook
+
+`POST /webhooks/shopify/orders-create` verifies the base64 HMAC-SHA256 signature over the raw request body, then maps the `orders/create` webhook to canonical order fields. The Shopify webhook ID is the gateway idempotency key. Only the mapped customer/contact, currency, line SKU, quantity and string unit price are forwarded; Shopify totals, taxes, discounts and shipping are ignored. Missing SKU or contact rejects the order.
+
+### Odoo adapter and shipments
+
+Odoo uses the JSON-2 API with an API key bearer token. XML-RPC/JSON-RPC are not used because they were deprecated in Odoo 19 and parts are removed in Odoo 20. Order creation searches `sale.order.client_order_ref` before create so a retry after a lost response reuses the same ERP order.
+
+| Gateway field | Odoo field | Mapping |
+| --- | --- | --- |
+| order external key | `sale.order.client_order_ref` | `GW-` plus the worker's gateway UUID external ID |
+| customer | `res.partner` | Search case-insensitive email; otherwise exact name and phone; create when missing |
+| currency | — | Must equal `ODOO_EXPECTED_CURRENCY` |
+| `lines[].sku` | `product.product.default_code` | Exact active match; unknown or ambiguous SKU is permanent failure |
+| `lines[].qty` | `order_line.product_uom_qty` | Integer quantity |
+| `lines[].unit_price` | `order_line.price_unit` | `Decimal` converted to JSON number only at the Odoo boundary |
+| lines | `order_line` | Odoo ORM command list `[[0, 0, {...}], ...]` |
+
+`POST /shipments` requires an HMAC-SHA256 signature in `X-Gateway-Signature`. The shipment row and `shipment.received` event are stored before the synchronous stock adjustment. Odoo inventory markers make each line idempotent; a repeated applied shipment replays the stored response. This PowerShell example reads the secret from `.env` without printing it:
+
+```powershell
+$OrderId = Read-Host "Confirmed gateway order UUID"
+$ShipmentId = "SHP-$([guid]::NewGuid())"
+$ShipmentSecret = (Get-Content .env | Where-Object { $_ -match '^SHIPMENT_WEBHOOK_SECRET=' } | Select-Object -First 1) -replace '^SHIPMENT_WEBHOOK_SECRET=', ''
+$ShipmentBody = @{ shipment_id = $ShipmentId; order_id = $OrderId; lines = @(@{ sku = "BOOK"; qty = 1 }) } | ConvertTo-Json -Compress -Depth 5
+$Hmac = [Security.Cryptography.HMACSHA256]::new([Text.Encoding]::UTF8.GetBytes($ShipmentSecret))
+$Signature = [Convert]::ToBase64String($Hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($ShipmentBody)))
+Invoke-RestMethod -Method Post -Uri http://localhost:8002/shipments -ContentType "application/json" -Headers @{ "X-Gateway-Signature" = $Signature } -Body $ShipmentBody
 ```
 
-Prices must be JSON strings, such as `"12.50"`. JSON numeric prices are rejected by design so the API never converts a binary float into money.
+Reuse this signing example for [the optional Odoo demo](docs/demo.md#optional-odoo-demo).
 
-Send it to `POST /orders` with an `Idempotency-Key` header. The server returns `201` for a new valid order, `200` for a repeated identical request, `409` for reuse with a different body, `422` for a stored rejected order, and `400` when the key is missing. `GET /orders/{order_id}` returns the order with its audit events.
-
-The API and worker read `DATABASE_URL`. Tests use `TEST_DATABASE_URL`, shown in `.env.example`, and never connect to the `order_gateway` database.
-
-## Mock ERP
-
-- `POST /sales-orders` creates an ERP order once per `external_id`; duplicate requests return `409` with the existing `erp_order_id`.
-- `GET /sales-orders` lists records; `GET /sales-orders/{erp_order_id}` returns one record.
-- `POST /admin/faults` accepts `none`, `error_500`, `rate_limit_429`, `error_422`, `timeout`, or `slow`, plus optional `fail_rate` (0–1) and `latency_ms`; `POST /admin/reset` clears its in-memory records and all fault settings.
-- `POST /orders/{order_id}/retry` requeues an order in `FAILED_DEAD` and returns it to job state `QUEUED`.
-
-## Stale job recovery
-
-The worker recovers jobs left in `PROCESSING` past `STALE_JOB_SECONDS`; recovered jobs retry unless they have reached `MAX_ATTEMPTS`.
-
-## Shopify `orders/create` webhook
-
-1. The endpoint reads the raw request bytes once; Shopify's HMAC-SHA256 signature is verified against those exact bytes before parsing or storing anything.
-2. An empty or unset `SHOPIFY_WEBHOOK_SECRET` returns `503`; a missing or invalid signature returns `401`, and neither case stores data.
-3. A missing webhook ID returns `400`; a present topic other than `orders/create` is acknowledged with `200 {"status":"ignored"}` and is not stored.
-4. A valid `orders/create` body maps to only the canonical fields below, is serialized deterministically, and goes through the existing `submit_order` path and queue.
-5. New, replayed, and rejected orders return `200` with the order ID and status; bad payloads return `200` after storage as `REJECTED` so Shopify does not retry permanent input errors forever.
-
-Configure `SHOPIFY_WEBHOOK_SECRET` with the secret for this subscription. The endpoint accepts the legacy `X-Shopify-*` webhook headers only; newer Events delivery header names without `X-` are unsupported.
-
-### Shopify mapping
-
-| Canonical field | Shopify path (first usable value wins) | Rule |
-| --- | --- | --- |
-| `source` | Constant | `shopify` |
-| `external_ref` | `id` | Convert to string |
-| `customer.name` | `customer.first_name` + `customer.last_name`; then `shipping_address.name`; then `billing_address.name` | Join non-empty name parts with one space, trim, and reject if no usable value |
-| `customer.email` | `email`; then `customer.email` | Trim; omit if neither is usable |
-| `customer.phone` | `phone`; then `customer.phone`; then `shipping_address.phone` | Trim; omit if none is usable |
-| Contact requirement | `customer.email` or `customer.phone` | Reject if both are absent or empty |
-| `currency` | `currency` | Keep as supplied; canonical validation requires a three-letter code |
-| `lines[].sku` | `line_items[].sku` | Trim; required and non-empty; never invent a value |
-| `lines[].qty` | `line_items[].quantity` | Integer |
-| `lines[].unit_price` | `line_items[].price` | Preserve the string exactly; never convert through float |
-| `lines` | `line_items` | Must be a non-empty list |
-
-Null, missing, and empty strings are not usable mapping values. `total_price`, `subtotal_price`, tax, discounts, shipping, gift cards, `name`, `order_number`, and all other Shopify fields are ignored. The gateway computes the total from line items, so Shopify's totals do not affect the stored order. SKU is required. This module supports one store and only the `orders/create` topic.
-
-### Live test (manual)
-
-- Create a free Shopify development store.
-- Create a webhook subscription for `orders/create` pointing to a public tunnel URL ending in `/webhooks/shopify/orders-create`.
-- Confirm in current Shopify docs which signing secret applies to the method used to create the webhook, then set that secret as `SHOPIFY_WEBHOOK_SECRET`.
-- Place a test order and confirm one gateway order reaches `CONFIRMED`.
-- Resend the same webhook from Shopify and confirm the gateway still has one order for that webhook ID.
-
-## Module 4: Odoo adapter and shipments
-
-The Odoo adapter sends confirmed gateway orders to Odoo and applies signed shipment stock adjustments.
-It uses Odoo 19 JSON-2 with an API key as a bearer token.
-It does not use XML-RPC or JSON-RPC; those APIs were deprecated in Odoo 19 and parts are removed in Odoo 20.
-`ERP_ADAPTER=mock` remains the default and preserves the existing mock ERP behavior.
-Set `ERP_ADAPTER=odoo` to send orders to Odoo and enable `POST /shipments`.
-
-### Start the Odoo profile
-
-The `odoo` Compose profile is isolated from plain `docker compose up -d` and uses its own PostgreSQL and filestore volumes. From the repository root:
+To start the optional Odoo profile, initialize its own database and then run the Odoo service:
 
 ```powershell
 docker compose --profile odoo up -d odoo-db
@@ -108,75 +164,86 @@ docker compose --profile odoo run --rm odoo odoo -d gateway -i base,sale_managem
 docker compose --profile odoo up -d odoo
 ```
 
-Wait for Odoo at `http://localhost:8069`, then create an API key in Preferences → Account Security. Put it in `.env` as `ODOO_API_KEY`; do not commit or log it. For Compose, set `ERP_ADAPTER=odoo`, `ODOO_BASE_URL=http://odoo:8069`, and `ODOO_DB=gateway`. Set `ODOO_PG_USER` and `ODOO_PG_PASSWORD` for the Odoo-only database, then seed products and opening inventory:
+Wait for `http://localhost:8069`, create an API key under Preferences → Account Security, and put it in `.env` as `ODOO_API_KEY`. Set `ERP_ADAPTER=odoo`, `ODOO_BASE_URL=http://odoo:8069`, and `ODOO_DB=gateway` in `.env`, then run `docker compose --profile odoo up -d --build`. Seed the fixture SKUs and opening inventory with:
 
 ```powershell
-docker compose --profile odoo up -d --build
 $env:ODOO_BASE_URL = "http://localhost:8069"
 .\.venv\Scripts\python.exe scripts\odoo_seed.py
 ```
 
-`ODOO_IMAGE` defaults to `odoo:19.0`. To return to the unchanged mock ERP behavior, set `ERP_ADAPTER=mock` and run `docker compose up -d --build`.
+The [Odoo API notes](docs/odoo-notes.md) contain the verified local request/response observations.
 
-The seed script ensures these fixture/test SKUs exist as active storable products and seeds 100 units when no stock quant exists: `BOOK`, `PEN`, `X`, `TSHIRT-BLK-M`, `MUG-WHT`, `NOTEBOOK-A5`, and `TEA`. It leaves existing on-hand quantities unchanged when run again.
-
-### Order mapping and idempotency
-
-| Gateway field | Odoo field | Mapping |
-| --- | --- | --- |
-| order external key | `sale.order.client_order_ref` | `GW-` + the existing worker `external_id` (gateway order UUID) |
-| customer | `res.partner` | Search case-insensitive email first, else exact name and phone; create with name, email, and phone if missing |
-| currency | — | Must equal `ODOO_EXPECTED_CURRENCY`; otherwise fail permanently with `currency_mismatch` |
-| `lines[].sku` | `product.product.default_code` | Exact active match; unknown or duplicate SKU fails permanently |
-| `lines[].qty` | `sale.order.order_line[].product_uom_qty` | Preserve integer quantity |
-| `lines[].unit_price` | `sale.order.order_line[].price_unit` | Convert `Decimal` to a JSON number at the Odoo boundary only |
-| lines | `sale.order.order_line` | `[[0, 0, {values}], ...]` ORM commands |
-
-Before creating a sale order, the adapter searches `client_order_ref`. A found `sale` or `done` order is returned as a duplicate; `draft` or `sent` is confirmed and returned as a duplicate. This makes a retry after a lost create response reuse the same Odoo order. The `order.confirmed` audit details add `duplicate: true` for duplicate results from Odoo; the mock ERP audit detail shape is unchanged.
-
-### Signed shipments
-
-Shipments are synchronous and require `ERP_ADAPTER=odoo`. The endpoint verifies `X-Gateway-Signature` as base64 HMAC-SHA256 over the raw request bytes using `SHIPMENT_WEBHOOK_SECRET`. Example using Python and the already installed `httpx` package:
-
-```python
-import base64, hashlib, hmac, json, httpx
-
-secret = "read-from-your-environment"
-body = json.dumps({
-    "shipment_id": "SHP-1001",
-    "order_id": "<confirmed-gateway-order-uuid>",
-    "lines": [{"sku": "BOOK", "qty": 2}],
-}, separators=(",", ":")).encode()
-signature = base64.b64encode(hmac.new(secret.encode(), body, hashlib.sha256).digest()).decode()
-response = httpx.post(
-    "http://127.0.0.1:8002/shipments",
-    content=body,
-    headers={"X-Gateway-Signature": signature, "Content-Type": "application/json"},
-)
-print(response.status_code, response.json())
-```
-
-The gateway stores the first event as `PENDING`, applies each line through `stock.quant`, then marks it `APPLIED`. Retries search `stock.move.reference` for `GW-SHIP:<shipment_id>:<sku>` before adjusting that line, so a partial Odoo success resumes without double-decrementing. Reusing a shipment ID with another canonical body returns `409`.
-
-### Odoo limits and verified API notes
-
-- A simultaneous first order for the same new customer can create duplicate partner records.
-- Money stays `Decimal` except the final `price_unit` conversion required by Odoo's JSON number API.
-- Counted-quantity adjustments can race with other stock changes in Odoo; the gateway does not enforce cumulative shipped quantity against ordered quantity.
-- Shipments are synchronous, use one warehouse (`ODOO_WAREHOUSE_CODE`), and support no lots or serial numbers.
-- The order currency must match `ODOO_EXPECTED_CURRENCY`.
-- Odoo Online plans may restrict external API access; this setup targets the self-hosted Community image.
-- The live probe confirmed `search_read` uses `domain`, `fields`, and `limit`; `create` uses `vals_list`; `action_confirm` uses `ids`; warehouse `lot_stock_id` is `[id, name]`; and storable products use `type="consu"` plus `is_storable=true`.
-- The probe confirmed the inventory flow uses `stock.quant` `write`/`create` with `inventory_mode`, then `action_apply_inventory` with `inventory_name`. The marker is searchable on `stock.move.reference`; `stock.move.name` does not exist.
-- Odoo error bodies include `name`, `message`, `arguments`, `context`, and sometimes `debug`. The adapter logs only the message, truncated to 500 characters, and never logs the key or traceback body.
-- Recorded requests and responses are summarized in [docs/odoo-notes.md](docs/odoo-notes.md). The sale order create command and `state` values remain to be confirmed by the opt-in live smoke test.
-
-### Odoo smoke test
-
-Seed `BOOK`, use a host-reachable URL for local pytest, and set the live flag:
+For the opt-in live smoke test, seed a SKU and set the host-reachable Odoo URL:
 
 ```powershell
 $env:ODOO_BASE_URL = "http://localhost:8069"
 $env:ODOO_LIVE = "1"
 .\.venv\Scripts\python.exe -m pytest -m live_odoo -v
+```
+
+## Configuration
+
+| Variable | Default | Meaning | Secret? |
+| --- | --- | --- | --- |
+| `DATABASE_URL` | Compose PostgreSQL URL | Application database | No (local dev credentials) |
+| `TEST_DATABASE_URL` | `order_gateway_test` on port 5433 | Isolated pytest database; name must end `_test` | No (local dev credentials) |
+| `ERP_ADAPTER` | `mock` | `mock` or `odoo` | No |
+| `ERP_BASE_URL` | `http://mock_erp:9001` | Mock ERP endpoint | No |
+| `ERP_TIMEOUT_SECONDS` | `5` | ERP request timeout | No |
+| `WORKER_POLL_INTERVAL_SECONDS` | `1` | Worker idle polling interval | No |
+| `RETRY_BASE_SECONDS` | `2` | Exponential retry base | No |
+| `RETRY_MAX_SECONDS` | `60` | Retry delay cap | No |
+| `MAX_ATTEMPTS` | `5` | Maximum worker attempts | No |
+| `STALE_JOB_SECONDS` | `120` | Stale claim recovery threshold | No |
+| `SHOPIFY_WEBHOOK_SECRET` | empty | Shopify webhook HMAC secret | Yes |
+| `SHIPMENT_WEBHOOK_SECRET` | empty | Shipment HMAC secret | Yes |
+| `ADMIN_TOKEN` | empty | Admin login token; minimum 16 characters | Yes |
+| `ODOO_BASE_URL` | empty | Odoo JSON-2 base URL | No |
+| `ODOO_DB` | `gateway` | Odoo database header | No |
+| `ODOO_API_KEY` | empty | Odoo bearer API key | Yes |
+| `ODOO_EXPECTED_CURRENCY` | `USD` | Accepted Odoo order currency | No |
+| `ODOO_WAREHOUSE_CODE` | `WH` | Odoo stock warehouse | No |
+| `ODOO_IMAGE` | `odoo:19.0` | Pinned Odoo image tag | No |
+| `ODOO_PG_USER` | `odoo` | Odoo-only PostgreSQL user | No |
+| `ODOO_PG_PASSWORD` | placeholder in `.env.example` | Odoo-only PostgreSQL password | Yes |
+| `ODOO_LIVE` | unset | Set to `1` to run the opt-in live Odoo smoke test | No |
+
+## What is verified and what is not
+
+- Automated test count: `__ tests` (fill in after running pytest).
+- Odoo live smoke test: passed locally with the opt-in `ODOO_LIVE=1` setting.
+- Shopify live-store test: not yet done; mapping fixtures and signature behavior are tested locally.
+- Odoo API calls are documented in [docs/odoo-notes.md](docs/odoo-notes.md); the sale-order create flow should also be checked with the opt-in live smoke test for the Odoo instance in use.
+
+## Known limitations
+
+- Shopify `total_price` is ignored; the gateway computes the total from lines.
+- A missing Shopify SKU rejects the order.
+- The same Shopify order under a different webhook ID creates a second order.
+- Only one Shopify topic is supported.
+- Two simultaneous first orders for one new Odoo customer can create duplicate partner records.
+- Money converts to float only at the Odoo JSON boundary.
+- Counted-quantity stock adjustments can race with other Odoo stock changes.
+- There is no cumulative shipped-versus-ordered quantity check.
+- Shipments are synchronous and use one warehouse.
+- Order currency must match `ODOO_EXPECTED_CURRENCY`.
+- Odoo Online plans may restrict external API access.
+- Admin uses one shared token, has no per-user identity and no login rate limiting.
+- The API retry endpoint has no authentication in v1.
+- The admin cookie is not marked `Secure` over plain HTTP.
+
+## Roadmap
+
+- Layer 2: workflow registry, roles and approvals.
+- Layer 3: natural-language proposals that can only propose changes.
+
+## Project layout
+
+```text
+app/                 FastAPI app, adapters, admin pages, services and worker
+migrations/          Alembic schema history
+mock_erp/            In-memory mock ERP and fault injection
+tests/               PostgreSQL-backed tests and recorded Odoo fixtures
+docs/                Odoo notes, demo script and portfolio checklist
+docker-compose.yml   Local services and optional Odoo profile
 ```

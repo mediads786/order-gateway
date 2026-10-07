@@ -4,6 +4,10 @@ from app.adapters.base import ErpAdapter
 from app.adapters.mock import MockErpAdapter
 
 
+class AdapterConfigurationError(RuntimeError):
+    """Raised when an adapter cannot be created from its required settings."""
+
+
 def get_adapter() -> ErpAdapter:
     kind = os.getenv("ERP_ADAPTER", "mock").strip().lower()
     if kind == "mock":
@@ -12,7 +16,7 @@ def get_adapter() -> ErpAdapter:
         base_url = os.getenv("ODOO_BASE_URL", "").strip()
         api_key = os.getenv("ODOO_API_KEY", "").strip()
         if not base_url or not api_key:
-            raise RuntimeError("ERP_ADAPTER=odoo requires ODOO_BASE_URL and ODOO_API_KEY")
+            raise AdapterConfigurationError("ERP_ADAPTER=odoo requires ODOO_BASE_URL and ODOO_API_KEY")
         from app.adapters.odoo import OdooAdapter
 
         return OdooAdapter(base_url=base_url, api_key=api_key)
