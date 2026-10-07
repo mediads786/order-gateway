@@ -11,6 +11,11 @@ An idempotent order intake and delivery service that stores orders in PostgreSQL
 - Retries temporary ERP failures and records exhausted jobs as dead letters.
 - Keeps an append-only audit trail for orders and shipments.
 - Supports a mock ERP by default, an Odoo 19 adapter, and signed shipment adjustments.
+- Registers governed workflows with hashed API keys, role checks, request IDs, and an append-only audit trail.
+
+- Supports a mock ERP by default, an Odoo 19 adapter, and signed shipment adjustments.
+
+Design rationale: [docs/design-decisions.md](docs/design-decisions.md)
 
 ## Architecture
 
@@ -23,6 +28,7 @@ flowchart LR
   end
   subgraph Gateway
     API[FastAPI intake<br/>validate + idempotency]
+    GOV[Workflow registry<br/>API-key governance]
     PG[(PostgreSQL<br/>orders, jobs, audit)]
     WK[Worker<br/>SKIP LOCKED, retries, dead letters]
     AD[Adapter interface]
@@ -35,6 +41,8 @@ flowchart LR
   W --> API
   S --> API
   SH --> API
+  GOV --> PG
+  GOV --> API
   API --> PG
   PG --> WK
   WK --> AD
@@ -44,7 +52,7 @@ flowchart LR
   UI --> PG
 ```
 
-The API validates and stores orders and idempotency records in one PostgreSQL transaction. Valid orders create a queued job and audit event atomically. A separate worker claims jobs with `FOR UPDATE SKIP LOCKED`, calls the configured ERP adapter, and records retry or completion events. Shopify orders are authenticated from their original request bytes before mapping. Shipment requests are signed and applied synchronously through the Odoo adapter. The server-rendered admin pages read the same order, job, shipment, and audit tables.
+The API validates and stores orders and idempotency records in one PostgreSQL transaction. Valid orders create a queued job and audit event atomically. A separate worker claims jobs with `FOR UPDATE SKIP LOCKED`, calls the configured ERP adapter, and records retry or completion events. Shopify orders are authenticated from their original request bytes before mapping. Shipment requests are signed and applied synchronously through the Odoo adapter. Workflow requests use named registry entries and database-backed API-key roles; every authenticated request gets a request ID and append-only workflow audit events. The server-rendered admin pages read the same order, job, shipment, and workflow audit tables.
 
 ```mermaid
 stateDiagram-v2
@@ -106,13 +114,38 @@ The test fixture reads `TEST_DATABASE_URL` from the environment or `.env`, creat
 
 ## Demo
 
-Follow the [3-minute PowerShell demo](docs/demo.md).
+Follow the [3-minute operations demo](docs/demo.md) or the [about-60-second governance demo](docs/demo.md#governance-demo-about-60-seconds).
 
 ## Admin pages
 
 `/admin` provides a status-filtered order list with counts, a detail page with lines, job state, shipments and the oldest-first audit trail, and a retry button for `FAILED_DEAD` orders. The shared `ADMIN_TOKEN` is compared with a constant-time check; the browser receives a signed `gw_admin` cookie, never the token itself. Admin responses disable caching and framing and use a restrictive content security policy. State changes use POST forms, and `SameSite=Strict` cookies provide the v1 CSRF protection. `ADMIN_TOKEN` must contain at least 16 characters; otherwise all admin routes return `503 admin_disabled`.
 
 The admin has one shared identity, so an admin retry audit event cannot identify an individual, and there is no login rate limiting. The API retry endpoint remains unauthenticated in v1. Cookies are marked `Secure` only when served over HTTPS; plain local HTTP does not set that attribute.
+
+## Workflow governance
+
+Migration `0006_workflow_governance` adds database-backed API keys and append-only `workflow_events`. API keys are stored as SHA-256 hashes; the raw key is printed only at creation. `operator`, `approver`, and `admin` are the supported roles. Send the key in `X-API-Key`; callers cannot select their own role. `GET /workflows` returns the registered schemas. `POST /workflows/{name}/requests` accepts `{"input": {...}}`, and executable order intake also requires `Idempotency-Key`. Responses include a `request_id` in both the JSON body and `X-Request-Id` header. Unauthorized calls do not create workflow events; authenticated denials and outcomes are audited without storing raw request bodies or API keys.
+
+The registry contains `create_order` (low risk, executable), `adjust_stock` (high risk, registered but not executable in this module), and `cancel_order` (medium risk, registered but not executable in this module). Operators and admins can request these workflows; approvers can inspect the registry but cannot request them. Approval does not execute an operation in this module.
+
+Create, list, or deactivate keys from the repository root after migrations have run:
+
+```powershell
+python -m scripts.api_keys create --name warehouse-operator --role operator
+python -m scripts.api_keys list
+python -m scripts.api_keys deactivate --name warehouse-operator
+```
+
+Copy the created key securely; it cannot be retrieved later. Example requests:
+
+```powershell
+$Key = Read-Host "API key"
+Invoke-RestMethod -Uri http://localhost:8002/workflows -Headers @{ "X-API-Key" = $Key }
+$Body = '{"input":{"source":"manual","external_ref":"workflow-demo","customer":{"name":"Ada","email":"ada@example.com"},"currency":"USD","lines":[{"sku":"BOOK","qty":1,"unit_price":"19.99"}]}}'
+Invoke-RestMethod -Method Post -Uri http://localhost:8002/workflows/create_order/requests -Headers @{ "X-API-Key" = $Key; "Idempotency-Key" = "workflow-demo-1" } -ContentType "application/json" -Body $Body
+```
+
+The admin navigation includes `/admin/workflow-events`, a read-only, newest-first view with event-type filtering. It escapes event details before rendering. Workflow audit events are append-only at the database level; `TRUNCATE` remains available to the test fixture.
 
 ## How it works
 
@@ -234,7 +267,7 @@ $env:ODOO_LIVE = "1"
 
 ## Roadmap
 
-- Layer 2: workflow registry, roles and approvals.
+- Layer 2: workflow registry and API-key roles are implemented; registered adjustment and cancellation workflows remain non-executable.
 - Layer 3: natural-language proposals that can only propose changes.
 
 ## Project layout

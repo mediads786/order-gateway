@@ -55,3 +55,44 @@ Invoke-RestMethod -Method Post -Uri "$Api/orders" -Headers @{ "Idempotency-Key" 
 ## Optional Odoo demo (requires Module 4 setup)
 
 Set `ERP_ADAPTER=odoo`, configure the Odoo URL and API key in `.env`, and use the existing signed shipment example in the README. Send a gateway order for a seeded SKU, show its confirmed sale order in Odoo, apply a one-unit signed shipment, and show the stock decrease. Resend that shipment and show that stock does not change again.
+
+## Governance demo (about 60 seconds)
+
+Run after the normal Compose stack is up and migration `0006` has been applied. Create an operator and approver key; copy each printed key into the corresponding variable when prompted. API keys are shown once.
+
+```powershell
+python -m scripts.api_keys create --name demo-operator --role operator
+$OperatorKey = Read-Host "Paste the new operator key"
+python -m scripts.api_keys create --name demo-approver --role approver
+$ApproverKey = Read-Host "Paste the new approver key"
+$Api = "http://localhost:8002"
+
+function Show-HttpResult($Method, $Uri, $Headers, $Body = $null) {
+  try {
+    if ($null -eq $Body) {
+      $result = Invoke-WebRequest -Method $Method -Uri $Uri -Headers $Headers
+    } else {
+      $result = Invoke-WebRequest -Method $Method -Uri $Uri -Headers $Headers -ContentType "application/json" -Body $Body
+    }
+    "HTTP $([int]$result.StatusCode)"
+    $result.Content
+  } catch [System.Net.WebException] {
+    $response = $_.Exception.Response
+    if ($null -eq $response) { throw }
+    "HTTP $([int]$response.StatusCode)"
+    $reader = [IO.StreamReader]::new($response.GetResponseStream())
+    try { $reader.ReadToEnd() } finally { $reader.Dispose(); $response.Dispose() }
+  }
+}
+
+Show-HttpResult GET "$Api/workflows" @{ "X-API-Key" = $OperatorKey }
+$OrderInput = @{ source = "manual"; external_ref = "governance-demo"; customer = @{ name = "Demo Operator"; email = "demo@example.com" }; currency = "USD"; lines = @(@{ sku = "ABC"; qty = 1; unit_price = "19.99" }) }
+$RequestBody = @{ input = $OrderInput } | ConvertTo-Json -Depth 8 -Compress
+Show-HttpResult POST "$Api/workflows/create_order/requests" @{ "X-API-Key" = $OperatorKey; "Idempotency-Key" = "governance-demo-1" } $RequestBody
+Show-HttpResult POST "$Api/workflows/create_order/requests" @{ "X-API-Key" = $ApproverKey; "Idempotency-Key" = "governance-demo-2" } $RequestBody
+$StockInput = @{ input = @{ order_id = $null; sku = "ABC"; qty_delta = 1; reason = "Demo request" } } | ConvertTo-Json -Depth 5 -Compress
+Show-HttpResult POST "$Api/workflows/adjust_stock/requests" @{ "X-API-Key" = $OperatorKey; "Idempotency-Key" = "governance-demo-3" } $StockInput
+Start-Process "$Api/admin/workflow-events"
+```
+
+Expected sequence: registry `200`, operator order request `201`, approver request `403`, registered stock adjustment `501`; then view the corresponding requested, denied, executed, and not-executable entries in the admin audit page. The adjustment is recorded as non-executable and does not change stock.
