@@ -30,6 +30,16 @@ if not test_database_url:
 if not test_database_url:
     pytest.exit("TEST_DATABASE_URL must point to a dedicated database ending in '_test'", returncode=4)
 
+env_file = PROJECT_ROOT / ".env"
+if env_file.is_file():
+    env_names = {
+        "ODOO_BASE_URL", "ODOO_DB", "ODOO_API_KEY", "ODOO_EXPECTED_CURRENCY", "ODOO_WAREHOUSE_CODE",
+    }
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        name, separator, value = line.partition("=")
+        if separator and name.strip() in env_names:
+            os.environ.setdefault(name.strip(), value.strip().strip("\"'"))
+
 try:
     test_url = make_url(test_database_url)
 except Exception as exc:
@@ -40,6 +50,7 @@ if not test_url.database or not test_url.database.endswith("_test"):
 
 os.environ["DATABASE_URL"] = test_database_url
 os.environ["ERP_BASE_URL"] = ERP_TEST_URL
+os.environ["ERP_ADAPTER"] = "mock"
 admin_url = test_url.set(drivername="postgresql", database="postgres")
 try:
     with psycopg.connect(admin_url.render_as_string(hide_password=False), autocommit=True) as connection:
@@ -76,7 +87,7 @@ def clear_database(migrate_test_database, mock_erp_service):
     reset_response = httpx.post(f"{ERP_TEST_URL}/admin/reset", timeout=3)
     reset_response.raise_for_status()
     with SessionLocal.begin() as db:
-        db.execute(text("TRUNCATE audit_events, idempotency_keys, jobs, order_lines, orders RESTART IDENTITY CASCADE"))
+        db.execute(text("TRUNCATE audit_events, shipments, idempotency_keys, jobs, order_lines, orders RESTART IDENTITY CASCADE"))
 
 
 @pytest.fixture

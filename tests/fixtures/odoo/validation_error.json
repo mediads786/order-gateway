@@ -1,0 +1,10 @@
+{
+  "label": "recorded from local Odoo 19.0, sanitized",
+  "status": 422,
+  "response": {
+    "name": "odoo.exceptions.ValidationError",
+    "message": "The operation cannot be completed: You can not have two users with the same login!",
+    "arguments": ["The operation cannot be completed: You can not have two users with the same login!"],
+    "context": {}
+  }
+}

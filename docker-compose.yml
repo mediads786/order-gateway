@@ -19,6 +19,15 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://order_gateway:order_gateway@db:5432/order_gateway
       SHOPIFY_WEBHOOK_SECRET: ${SHOPIFY_WEBHOOK_SECRET:-}
+      ERP_ADAPTER: ${ERP_ADAPTER:-mock}
+      ERP_BASE_URL: ${ERP_BASE_URL:-http://mock_erp:9001}
+      ERP_TIMEOUT_SECONDS: ${ERP_TIMEOUT_SECONDS:-5}
+      ODOO_BASE_URL: ${ODOO_BASE_URL:-}
+      ODOO_DB: ${ODOO_DB:-gateway}
+      ODOO_API_KEY: ${ODOO_API_KEY:-}
+      ODOO_EXPECTED_CURRENCY: ${ODOO_EXPECTED_CURRENCY:-USD}
+      ODOO_WAREHOUSE_CODE: ${ODOO_WAREHOUSE_CODE:-WH}
+      SHIPMENT_WEBHOOK_SECRET: ${SHIPMENT_WEBHOOK_SECRET:-}
     ports:
       - "127.0.0.1:8002:8000"
     healthcheck:
@@ -44,8 +53,14 @@ services:
     command: ["python", "-m", "app.workers.worker"]
     environment:
       DATABASE_URL: postgresql+psycopg://order_gateway:order_gateway@db:5432/order_gateway
-      ERP_BASE_URL: http://mock_erp:9001
+      ERP_ADAPTER: ${ERP_ADAPTER:-mock}
+      ERP_BASE_URL: ${ERP_BASE_URL:-http://mock_erp:9001}
       ERP_TIMEOUT_SECONDS: ${ERP_TIMEOUT_SECONDS:-5}
+      ODOO_BASE_URL: ${ODOO_BASE_URL:-}
+      ODOO_DB: ${ODOO_DB:-gateway}
+      ODOO_API_KEY: ${ODOO_API_KEY:-}
+      ODOO_EXPECTED_CURRENCY: ${ODOO_EXPECTED_CURRENCY:-USD}
+      ODOO_WAREHOUSE_CODE: ${ODOO_WAREHOUSE_CODE:-WH}
       WORKER_POLL_INTERVAL_SECONDS: ${WORKER_POLL_INTERVAL_SECONDS:-1}
       RETRY_BASE_SECONDS: ${RETRY_BASE_SECONDS:-2}
       RETRY_MAX_SECONDS: ${RETRY_MAX_SECONDS:-60}
@@ -58,5 +73,29 @@ services:
         condition: service_healthy
       mock_erp:
         condition: service_healthy
+  odoo-db:
+    image: postgres:16
+    profiles: ["odoo"]
+    environment:
+      POSTGRES_USER: ${ODOO_PG_USER:-odoo}
+      POSTGRES_PASSWORD: ${ODOO_PG_PASSWORD:-odoo-dev-password}
+    volumes:
+      - odoo_db_data:/var/lib/postgresql/data
+  odoo:
+    image: ${ODOO_IMAGE:-odoo:19.0}
+    profiles: ["odoo"]
+    depends_on:
+      - odoo-db
+    environment:
+      HOST: odoo-db
+      USER: ${ODOO_PG_USER:-odoo}
+      PASSWORD: ${ODOO_PG_PASSWORD:-odoo-dev-password}
+    ports:
+      - "8069:8069"
+    volumes:
+      - odoo_filestore:/var/lib/odoo
+    command: ["odoo", "-d", "gateway", "--db-filter=^gateway$"]
 volumes:
   postgres_data:
+  odoo_db_data:
+  odoo_filestore:

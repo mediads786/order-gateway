@@ -1,0 +1,109 @@
+﻿BASE=http://localhost:8069 DB=gateway
+
+### A1 bad key
+POST /json/2/res.partner/search_read
+request body: {"domain": [], "fields": ["name"], "limit": 1}
+HTTP 401
+{"name": "werkzeug.exceptions.Unauthorized", "message": "Invalid apikey", "arguments": ["Invalid apikey", 401], "context": {}, "debug": "Traceback (most recent call last):\n  File \"/usr/lib/python3/dist-packages/odoo/http.py\", line 2329, in _serve_db\n    return service_model.retrying(serve_func, env=self.env)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3/dist-packages/odoo/service/model.py\", line 188, in retrying\n    result = func()\n             ^^^^^^\n  File \"/usr/lib/python3/dist-packages/odoo/http.py\", line 2377, in _serve_ir_http\n    self.registry['ir.http']._authenticate(rule.endpoint)\n  File \"/usr/lib/python3/dist-packages/odoo/addons/base/models/ir_http.py\", line 273, in _authenticate\n    cls._authenticate_explicit(auth)\n  File \"/usr/lib/python3/dist-packages/odoo/addons/base/models/ir_http.py\", line 282, in _authenticate_explicit\n    getattr(cls, f'_auth_method_{auth}')()\n  File \"/usr/lib/python3/dist-packages/odoo/addons/base/models/ir_http.py\", line 240, in _auth_method_bearer\n    raise Unauthorized(e, www_authenticate=WWWAuthenticate('bearer'))\nwerkzeug.exceptions.Unauthorized: 401 Unauthorized: Invalid api
+
+### A2 unknown model
+POST /json/2/nope.model/search_read
+request body: {"domain": []}
+HTTP 404
+{"name": "werkzeug.exceptions.NotFound", "message": "the model 'nope.model' does not exist", "arguments": ["the model 'nope.model' does not exist", 404], "context": {}, "debug": "Traceback (most recent call last):\n  File \"/usr/lib/python3/dist-packages/odoo/addons/rpc/controllers/json2.py\", line 66, in web_json_2_rpc\n    Model = request.env[__model__].with_context(context)\n            ~~~~~~~~~~~^^^^^^^^^^^\n  File \"/usr/lib/python3/dist-packages/odoo/orm/environments.py\", line 107, in __getitem__\n    return self.registry[model_name](self, (), ())\n           ~~~~~~~~~~~~~^^^^^^^^^^^^\n  File \"/usr/lib/python3/dist-packages/odoo/orm/registry.py\", line 344, in __getitem__\n    return self.models[model_name]\n           ~~~~~~~~~~~^^^^^^^^^^^^\nKeyError: 'nope.model'\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/usr/lib/python3/dist-packages/odoo/http.py\", line 2329, in _serve_db\n    return service_model.retrying(serve_func, env=self.env)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3/dist-packages/odoo/service/model.py\", line 188, in retrying\n    result =
+
+### A3 unknown method
+POST /json/2/res.partner/nope_method
+request body: {"ids": []}
+HTTP 404
+{"name": "werkzeug.exceptions.NotFound", "message": "The method 'res.partner.nope_method' does not exist", "arguments": ["The method 'res.partner.nope_method' does not exist", 404], "context": {}, "debug": "Traceback (most recent call last):\n  File \"/usr/lib/python3/dist-packages/odoo/addons/rpc/controllers/json2.py\", line 72, in web_json_2_rpc\n    func = get_public_method(Model, __method__)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3/dist-packages/odoo/service/model.py\", line 60, in get_public_method\n    raise AttributeError(f\"The method '{model._name}.{name}' does not exist\")  # noqa: TRY004\n    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAttributeError: The method 'res.partner.nope_method' does not exist\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/usr/lib/python3/dist-packages/odoo/http.py\", line 2329, in _serve_db\n    return service_model.retrying(serve_func, env=self.env)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3/dist-packages/odoo/service/model.py\", line 188, in retrying\n    resul
+
+### A4 create with bad field
+POST /json/2/res.partner/create
+request body: {"vals_list": [{"nonexistent_field": 1}]}
+HTTP 500
+{"name": "builtins.ValueError", "message": "Invalid field 'nonexistent_field' in 'res.partner'", "arguments": ["Invalid field 'nonexistent_field' in 'res.partner'"], "context": {}, "debug": "Traceback (most recent call last):\n  File \"/usr/lib/python3/dist-packages/odoo/http.py\", line 2329, in _serve_db\n    return service_model.retrying(serve_func, env=self.env)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3/dist-packages/odoo/service/model.py\", line 188, in retrying\n    result = func()\n             ^^^^^^\n  File \"/usr/lib/python3/dist-packages/odoo/http.py\", line 2379, in _serve_ir_http\n    response = self.dispatcher.dispatch(rule.endpoint, args)\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3/dist-packages/odoo/http.py\", line 2659, in dispatch\n    result = self.request.registry['ir.http']._dispatch(endpoint)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3/dist-packages/odoo/addons/base/models/ir_http.py\", line 353, in _dispatch\n    result = endpoint(**request.params)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3/dist-p
+
+### A5 create with bad partner id
+POST /json/2/sale.order/create
+request body: {"vals_list": [{"partner_id": 999999999}]}
+HTTP 404
+{"name": "odoo.exceptions.MissingError", "message": "Record does not exist or has been deleted.\n(Record: res.partner(999999999,), User: 2)", "arguments": ["Record does not exist or has been deleted.\n(Record: res.partner(999999999,), User: 2)"], "context": {}, "debug": "Traceback (most recent call last):\n  File \"/usr/lib/python3/dist-packages/odoo/http.py\", line 2329, in _serve_db\n    return service_model.retrying(serve_func, env=self.env)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3/dist-packages/odoo/service/model.py\", line 188, in retrying\n    result = func()\n             ^^^^^^\n  File \"/usr/lib/python3/dist-packages/odoo/http.py\", line 2379, in _serve_ir_http\n    response = self.dispatcher.dispatch(rule.endpoint, args)\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3/dist-packages/odoo/http.py\", line 2659, in dispatch\n    result = self.request.registry['ir.http']._dispatch(endpoint)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3/dist-packages/odoo/addons/base/models/ir_http.py\", line 353, in _dispatch\n    result = endpoint(**request.p
+
+### B search_read ok
+POST /json/2/res.partner/search_read
+request body: {"domain": [], "fields": ["name", "email"], "limit": 2}
+HTTP 200
+[{"id": 3, "name": "Administrator", "email": false}, {"id": 1, "name": "My Company", "email": false}]
+
+### C1 product fields
+POST /json/2/product.product/fields_get
+request body: {"allfields": ["type", "is_storable", "default_code"], "attributes": ["string", "type", "selection"]}
+HTTP 200
+{"default_code": {"string": "Internal Reference", "type": "char"}, "type": {"selection": [["consu", "Goods"], ["service", "Service"], ["combo", "Combo"]], "string": "Product Type", "type": "selection"}, "is_storable": {"string": "Track Inventory", "type": "boolean"}}
+
+### C2 quant fields
+POST /json/2/stock.quant/fields_get
+request body: {"allfields": ["quantity", "inventory_quantity", "inventory_diff_quantity", "inventory_quantity_set", "location_id"], "attributes": ["string", "type"]}
+HTTP 200
+{"location_id": {"string": "Location", "type": "many2one"}, "quantity": {"string": "Quantity", "type": "float"}, "inventory_quantity": {"string": "Counted", "type": "float"}, "inventory_diff_quantity": {"string": "Difference", "type": "float"}, "inventory_quantity_set": {"string": "Inventory Quantity Set", "type": "boolean"}}
+
+### C3 move fields
+POST /json/2/stock.move/fields_get
+request body: {"allfields": ["name", "reference", "origin"], "attributes": ["string", "type"]}
+HTTP 200
+{"origin": {"string": "Source Document", "type": "char"}, "reference": {"string": "Reference", "type": "char"}}
+
+### D warehouse
+POST /json/2/stock.warehouse/search_read
+request body: {"domain": [["code", "=", "WH"]], "fields": ["code", "lot_stock_id"], "limit": 1}
+HTTP 200
+[{"id": 1, "code": "WH", "lot_stock_id": [5, "WH/Stock"]}]
+
+stock location id = 5
+
+### E1 create product (consu + is_storable)
+POST /json/2/product.product/create
+request body: {"vals_list": [{"name": "GW-PROBE", "default_code": "GW-PROBE", "type": "consu", "is_storable": true}]}
+HTTP 200
+[1]
+
+product id = 1
+
+### F1 create quant with counted qty 5
+POST /json/2/stock.quant/create
+request body: {"vals_list": [{"product_id": 1, "location_id": 5, "inventory_quantity": 5}], "context": {"inventory_mode": true}}
+HTTP 200
+[1]
+
+### F2 apply inventory with inventory_name
+POST /json/2/stock.quant/action_apply_inventory
+request body: {"ids": [1], "context": {"inventory_mode": true, "inventory_name": "GW-SHIP:PROBE:GW-PROBE"}}
+HTTP 200
+null
+
+### F3 on-hand after apply
+POST /json/2/stock.quant/search_read
+request body: {"domain": [["product_id", "=", 1], ["location_id", "=", 5]], "fields": ["quantity", "inventory_quantity"]}
+HTTP 200
+[{"id": 1, "quantity": 5.0, "inventory_quantity": 0.0}]
+
+### F4 find move by inventory_name (the idempotency marker)
+POST /json/2/stock.move/search_read
+request body: {"domain": [["name", "=", "GW-SHIP:PROBE:GW-PROBE"]], "fields": ["name", "reference", "product_id", "state", "quantity"]}
+HTTP 500
+{"name": "builtins.ValueError", "message": "Invalid field stock.move.name in condition ('name', '=', 'GW-SHIP:PROBE:GW-PROBE')", "arguments": ["Invalid field stock.move.name in condition ('name', '=', 'GW-SHIP:PROBE:GW-PROBE')"], "context": {}, "debug": "Traceback (most recent call last):\n  File \"/usr/lib/python3/dist-packages/odoo/orm/domains.py\", line 915, in __get_field\n    field = model._fields[field_name]\n            ~~~~~~~~~~~~~^^^^^^^^^^^^\nKeyError: 'name'\n\nDuring handling of the above exception, another exception occurred:\n\nTraceback (most recent call last):\n  File \"/usr/lib/python3/dist-packages/odoo/http.py\", line 2329, in _serve_db\n    return service_model.retrying(serve_func, env=self.env)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3/dist-packages/odoo/service/model.py\", line 188, in retrying\n    result = func()\n             ^^^^^^\n  File \"/usr/lib/python3/dist-packages/odoo/http.py\", line 2379, in _serve_ir_http\n    response = self.dispatcher.dispatch(rule.endpoint, args)\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3/dist-packages/odoo/http.py\", line 2659, in di
+
+### F5 all moves for probe product (to see what name looks like)
+POST /json/2/stock.move/search_read
+request body: {"domain": [["product_id", "=", 1]], "fields": ["name", "reference", "state"]}
+HTTP 500
+{"name": "builtins.ValueError", "message": "Invalid field 'name' on 'stock.move'", "arguments": ["Invalid field 'name' on 'stock.move'"], "context": {}, "debug": "Traceback (most recent call last):\n  File \"/usr/lib/python3/dist-packages/odoo/orm/models.py\", line 3857, in _determine_fields_to_fetch\n    field = self._fields[field_name]\n            ~~~~~~~~~~~~^^^^^^^^^^^^\nKeyError: 'name'\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/usr/lib/python3/dist-packages/odoo/http.py\", line 2329, in _serve_db\n    return service_model.retrying(serve_func, env=self.env)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3/dist-packages/odoo/service/model.py\", line 188, in retrying\n    result = func()\n             ^^^^^^\n  File \"/usr/lib/python3/dist-packages/odoo/http.py\", line 2379, in _serve_ir_http\n    response = self.dispatcher.dispatch(rule.endpoint, args)\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3/dist-packages/odoo/http.py\", line 2659, in dispatch\n    result = self.request.registry['ir.http']._dispatch(endpoint)\n   
+
+### G action_confirm with empty ids
+POST /json/2/sale.order/action_confirm
+request body: {"ids": []}
+HTTP 200
+true
+
+DONE

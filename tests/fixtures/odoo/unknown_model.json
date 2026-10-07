@@ -1,0 +1,10 @@
+{
+  "label": "recorded from local Odoo 19.0, sanitized",
+  "status": 404,
+  "response": {
+    "name": "werkzeug.exceptions.NotFound",
+    "message": "the model 'nope.model' does not exist",
+    "arguments": ["the model 'nope.model' does not exist", 404],
+    "context": {}
+  }
+}

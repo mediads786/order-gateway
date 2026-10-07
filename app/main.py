@@ -6,15 +6,26 @@ from datetime import timezone
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
 from sqlalchemy import func, select
 
 from app.db.models import AuditEvent, Job, Order
 from app.db.session import SessionLocal
+from app.adapters import get_adapter
+from app.core.schemas import ShipmentInput
 from app.services.orders import serialize_order, submit_order
+from app.services.shipments import apply_shipment, canonical_request_hash
 from app.services.shopify_webhooks import UnmappableShopifyOrder, map_shopify_order, verify_signature
 app = FastAPI()
 logger = logging.getLogger(__name__)
+
+
+@app.on_event("startup")
+async def validate_erp_adapter_setting() -> None:
+    adapter = os.getenv("ERP_ADAPTER", "mock").strip().lower()
+    if adapter not in {"mock", "odoo"}:
+        raise RuntimeError(f"Unsupported ERP_ADAPTER value: {adapter!r}; expected 'mock' or 'odoo'")
 
 
 @app.post("/orders")
@@ -74,6 +85,37 @@ async def shopify_orders_create(request: Request):
             status_code=200,
             content={"order_id": body["order_id"], "status": body["status"]},
         )
+    return JSONResponse(status_code=status_code, content=body)
+
+
+def _shipment_json_constant(value: str):
+    raise ValueError(f"Invalid JSON constant: {value}")
+
+
+@app.post("/shipments")
+async def create_shipment(request: Request):
+    raw_body = await request.body()
+    secret = os.getenv("SHIPMENT_WEBHOOK_SECRET", "")
+    if not secret:
+        logger.error("Shipment webhook secret is not configured")
+        return JSONResponse(status_code=503, content={"error": "shipment webhook is not configured"})
+    signature = request.headers.get("X-Gateway-Signature")
+    if not verify_signature(secret, signature, raw_body):
+        logger.warning("Rejected shipment webhook with invalid signature")
+        return JSONResponse(status_code=401, content={"error": "invalid signature"})
+    if os.getenv("ERP_ADAPTER", "mock").strip().lower() != "odoo":
+        return JSONResponse(status_code=501, content={"error": "shipments require ERP_ADAPTER=odoo"})
+    try:
+        decoded = json.loads(raw_body, parse_constant=_shipment_json_constant)
+        shipment = ShipmentInput.model_validate(decoded)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, ValidationError) as exc:
+        return JSONResponse(status_code=422, content={"detail": str(exc)})
+    shipment_id = shipment.shipment_id
+    order_id = str(shipment.order_id)
+    lines = [line.model_dump() for line in shipment.lines]
+    digest = canonical_request_hash(shipment_id, order_id, lines)
+    adapter = get_adapter()
+    status_code, body = await apply_shipment(shipment_id, shipment.order_id, lines, digest, adapter)
     return JSONResponse(status_code=status_code, content=body)
 
 

@@ -1,5 +1,6 @@
 from decimal import Decimal
 from typing import Literal
+import uuid
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
@@ -50,3 +51,25 @@ class OrderInput(BaseModel):
     customer: CustomerInput
     currency: str = Field(pattern=r"^[A-Za-z]{3}$")
     lines: list[LineInput] = Field(min_length=1)
+
+
+class ShipmentLineInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sku: str = Field(min_length=1)
+    qty: int = Field(gt=0, strict=True)
+
+    @field_validator("sku", mode="before")
+    @classmethod
+    def trim_sku(cls, value: object) -> str:
+        if not isinstance(value, str):
+            raise ValueError("sku must be a string")
+        return value.strip()
+
+
+class ShipmentInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    shipment_id: str = Field(min_length=1, max_length=100)
+    order_id: uuid.UUID
+    lines: list[ShipmentLineInput] = Field(min_length=1)

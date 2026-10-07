@@ -89,3 +89,94 @@ Null, missing, and empty strings are not usable mapping values. `total_price`, `
 - Confirm in current Shopify docs which signing secret applies to the method used to create the webhook, then set that secret as `SHOPIFY_WEBHOOK_SECRET`.
 - Place a test order and confirm one gateway order reaches `CONFIRMED`.
 - Resend the same webhook from Shopify and confirm the gateway still has one order for that webhook ID.
+
+## Module 4: Odoo adapter and shipments
+
+The Odoo adapter sends confirmed gateway orders to Odoo and applies signed shipment stock adjustments.
+It uses Odoo 19 JSON-2 with an API key as a bearer token.
+It does not use XML-RPC or JSON-RPC; those APIs were deprecated in Odoo 19 and parts are removed in Odoo 20.
+`ERP_ADAPTER=mock` remains the default and preserves the existing mock ERP behavior.
+Set `ERP_ADAPTER=odoo` to send orders to Odoo and enable `POST /shipments`.
+
+### Start the Odoo profile
+
+The `odoo` Compose profile is isolated from plain `docker compose up -d` and uses its own PostgreSQL and filestore volumes. From the repository root:
+
+```powershell
+docker compose --profile odoo up -d odoo-db
+docker compose --profile odoo run --rm odoo odoo -d gateway -i base,sale_management,stock --without-demo=all --stop-after-init
+docker compose --profile odoo up -d odoo
+```
+
+Wait for Odoo at `http://localhost:8069`, then create an API key in Preferences → Account Security. Put it in `.env` as `ODOO_API_KEY`; do not commit or log it. For Compose, set `ERP_ADAPTER=odoo`, `ODOO_BASE_URL=http://odoo:8069`, and `ODOO_DB=gateway`. Set `ODOO_PG_USER` and `ODOO_PG_PASSWORD` for the Odoo-only database, then seed products and opening inventory:
+
+```powershell
+docker compose --profile odoo up -d --build
+$env:ODOO_BASE_URL = "http://localhost:8069"
+.\.venv\Scripts\python.exe scripts\odoo_seed.py
+```
+
+`ODOO_IMAGE` defaults to `odoo:19.0`. To return to the unchanged mock ERP behavior, set `ERP_ADAPTER=mock` and run `docker compose up -d --build`.
+
+The seed script ensures these fixture/test SKUs exist as active storable products and seeds 100 units when no stock quant exists: `BOOK`, `PEN`, `X`, `TSHIRT-BLK-M`, `MUG-WHT`, `NOTEBOOK-A5`, and `TEA`. It leaves existing on-hand quantities unchanged when run again.
+
+### Order mapping and idempotency
+
+| Gateway field | Odoo field | Mapping |
+| --- | --- | --- |
+| order external key | `sale.order.client_order_ref` | `GW-` + the existing worker `external_id` (gateway order UUID) |
+| customer | `res.partner` | Search case-insensitive email first, else exact name and phone; create with name, email, and phone if missing |
+| currency | — | Must equal `ODOO_EXPECTED_CURRENCY`; otherwise fail permanently with `currency_mismatch` |
+| `lines[].sku` | `product.product.default_code` | Exact active match; unknown or duplicate SKU fails permanently |
+| `lines[].qty` | `sale.order.order_line[].product_uom_qty` | Preserve integer quantity |
+| `lines[].unit_price` | `sale.order.order_line[].price_unit` | Convert `Decimal` to a JSON number at the Odoo boundary only |
+| lines | `sale.order.order_line` | `[[0, 0, {values}], ...]` ORM commands |
+
+Before creating a sale order, the adapter searches `client_order_ref`. A found `sale` or `done` order is returned as a duplicate; `draft` or `sent` is confirmed and returned as a duplicate. This makes a retry after a lost create response reuse the same Odoo order. The `order.confirmed` audit details add `duplicate: true` for duplicate results from Odoo; the mock ERP audit detail shape is unchanged.
+
+### Signed shipments
+
+Shipments are synchronous and require `ERP_ADAPTER=odoo`. The endpoint verifies `X-Gateway-Signature` as base64 HMAC-SHA256 over the raw request bytes using `SHIPMENT_WEBHOOK_SECRET`. Example using Python and the already installed `httpx` package:
+
+```python
+import base64, hashlib, hmac, json, httpx
+
+secret = "read-from-your-environment"
+body = json.dumps({
+    "shipment_id": "SHP-1001",
+    "order_id": "<confirmed-gateway-order-uuid>",
+    "lines": [{"sku": "BOOK", "qty": 2}],
+}, separators=(",", ":")).encode()
+signature = base64.b64encode(hmac.new(secret.encode(), body, hashlib.sha256).digest()).decode()
+response = httpx.post(
+    "http://127.0.0.1:8002/shipments",
+    content=body,
+    headers={"X-Gateway-Signature": signature, "Content-Type": "application/json"},
+)
+print(response.status_code, response.json())
+```
+
+The gateway stores the first event as `PENDING`, applies each line through `stock.quant`, then marks it `APPLIED`. Retries search `stock.move.reference` for `GW-SHIP:<shipment_id>:<sku>` before adjusting that line, so a partial Odoo success resumes without double-decrementing. Reusing a shipment ID with another canonical body returns `409`.
+
+### Odoo limits and verified API notes
+
+- A simultaneous first order for the same new customer can create duplicate partner records.
+- Money stays `Decimal` except the final `price_unit` conversion required by Odoo's JSON number API.
+- Counted-quantity adjustments can race with other stock changes in Odoo; the gateway does not enforce cumulative shipped quantity against ordered quantity.
+- Shipments are synchronous, use one warehouse (`ODOO_WAREHOUSE_CODE`), and support no lots or serial numbers.
+- The order currency must match `ODOO_EXPECTED_CURRENCY`.
+- Odoo Online plans may restrict external API access; this setup targets the self-hosted Community image.
+- The live probe confirmed `search_read` uses `domain`, `fields`, and `limit`; `create` uses `vals_list`; `action_confirm` uses `ids`; warehouse `lot_stock_id` is `[id, name]`; and storable products use `type="consu"` plus `is_storable=true`.
+- The probe confirmed the inventory flow uses `stock.quant` `write`/`create` with `inventory_mode`, then `action_apply_inventory` with `inventory_name`. The marker is searchable on `stock.move.reference`; `stock.move.name` does not exist.
+- Odoo error bodies include `name`, `message`, `arguments`, `context`, and sometimes `debug`. The adapter logs only the message, truncated to 500 characters, and never logs the key or traceback body.
+- Recorded requests and responses are summarized in [docs/odoo-notes.md](docs/odoo-notes.md). The sale order create command and `state` values remain to be confirmed by the opt-in live smoke test.
+
+### Odoo smoke test
+
+Seed `BOOK`, use a host-reachable URL for local pytest, and set the live flag:
+
+```powershell
+$env:ODOO_BASE_URL = "http://localhost:8069"
+$env:ODOO_LIVE = "1"
+.\.venv\Scripts\python.exe -m pytest -m live_odoo -v
+```

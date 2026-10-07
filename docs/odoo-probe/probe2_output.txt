@@ -1,0 +1,75 @@
+﻿BASE=http://localhost:8069 DB=gateway
+
+### 1 find probe product
+POST /json/2/product.product/search_read  body: {"domain": [["default_code", "=", "GW-PROBE"]], "fields": ["id", "default_code"], "limit": 1}
+HTTP 200
+[{"id": 1, "default_code": "GW-PROBE"}]
+
+### 2 warehouse
+POST /json/2/stock.warehouse/search_read  body: {"domain": [["code", "=", "WH"]], "fields": ["lot_stock_id"], "limit": 1}
+HTTP 200
+[{"id": 1, "lot_stock_id": [5, "WH/Stock"]}]
+
+product id=1 location id=5
+
+### 3 moves for probe product (reference/origin)
+POST /json/2/stock.move/search_read  body: {"domain": [["product_id", "=", 1]], "fields": ["reference", "origin", "state", "quantity", "location_id"]}
+HTTP 200
+[{"id": 1, "reference": "GW-SHIP:PROBE:GW-PROBE", "origin": false, "state": "done", "quantity": 5.0, "location_id": [11, "Inventory adjustment"]}]
+
+### 4 move lines for probe product
+POST /json/2/stock.move.line/search_read  body: {"domain": [["product_id", "=", 1]], "fields": ["reference", "state", "quantity"]}
+HTTP 200
+[{"id": 1, "reference": "GW-SHIP:PROBE:GW-PROBE", "state": "done", "quantity": 5.0}]
+
+### 5a current quant
+POST /json/2/stock.quant/search_read  body: {"domain": [["product_id", "=", 1], ["location_id", "=", 5]], "fields": ["quantity"], "limit": 1}
+HTTP 200
+[{"id": 1, "quantity": 5.0}]
+
+### 5b set counted qty = on_hand - 1
+POST /json/2/stock.quant/write  body: {"ids": [1], "vals": {"inventory_quantity": 4.0}, "context": {"inventory_mode": true}}
+HTTP 200
+true
+
+### 5c apply with marker
+POST /json/2/stock.quant/action_apply_inventory  body: {"ids": [1], "context": {"inventory_mode": true, "inventory_name": "GW-SHIP:PROBE2:GW-PROBE"}}
+HTTP 200
+null
+
+### 5d on-hand after (expect on_hand - 1)
+POST /json/2/stock.quant/search_read  body: {"domain": [["id", "=", 1]], "fields": ["quantity"]}
+HTTP 200
+[{"id": 1, "quantity": 4.0}]
+
+### 5e search stock.move by reference == marker
+POST /json/2/stock.move/search_read  body: {"domain": [["reference", "=", "GW-SHIP:PROBE2:GW-PROBE"]], "fields": ["reference", "origin", "state", "quantity"]}
+HTTP 200
+[{"id": 34, "reference": "GW-SHIP:PROBE2:GW-PROBE", "origin": false, "state": "done", "quantity": 1.0}]
+
+### 5f search stock.move by origin == marker
+POST /json/2/stock.move/search_read  body: {"domain": [["origin", "=", "GW-SHIP:PROBE2:GW-PROBE"]], "fields": ["reference", "origin", "state", "quantity"]}
+HTTP 200
+[]
+
+### 5g search stock.move.line by reference == marker
+POST /json/2/stock.move.line/search_read  body: {"domain": [["reference", "=", "GW-SHIP:PROBE2:GW-PROBE"]], "fields": ["reference", "state", "quantity"]}
+HTTP 200
+[{"id": 34, "reference": "GW-SHIP:PROBE2:GW-PROBE", "state": "done", "quantity": 1.0}]
+
+### 6a apply again, no change
+POST /json/2/stock.quant/action_apply_inventory  body: {"ids": [1], "context": {"inventory_mode": true, "inventory_name": "GW-SHIP:PROBE2:GW-PROBE:again"}}
+HTTP 200
+null
+
+### 6b all moves now (expect no new ':again' move)
+POST /json/2/stock.move/search_read  body: {"domain": [["product_id", "=", 1]], "fields": ["reference", "state", "quantity"]}
+HTTP 200
+[{"id": 1, "reference": "GW-SHIP:PROBE:GW-PROBE", "state": "done", "quantity": 5.0}, {"id": 34, "reference": "GW-SHIP:PROBE2:GW-PROBE", "state": "done", "quantity": 1.0}, {"id": 35, "reference": "GW-SHIP:PROBE2:GW-PROBE:again", "state": "done", "quantity": 4.0}]
+
+### 7 create user with duplicate login
+POST /json/2/res.users/create  body: {"vals_list": [{"name": "GW Dup", "login": "admin"}]}
+HTTP 422
+{"name": "odoo.exceptions.ValidationError", "message": "The operation cannot be completed: You can not have two users with the same login!", "arguments": ["The operation cannot be completed: You can not have two users with the same login!"], "context": {}}
+
+DONE

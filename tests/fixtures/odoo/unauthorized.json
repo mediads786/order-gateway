@@ -1,0 +1,10 @@
+{
+  "label": "recorded from local Odoo 19.0, sanitized",
+  "status": 401,
+  "response": {
+    "name": "werkzeug.exceptions.Unauthorized",
+    "message": "Invalid apikey",
+    "arguments": ["Invalid apikey", 401],
+    "context": {}
+  }
+}

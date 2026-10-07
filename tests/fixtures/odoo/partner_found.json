@@ -1,0 +1,7 @@
+{
+  "label": "recorded from local Odoo 19.0, sanitized",
+  "response": [
+    {"id": 3, "name": "Administrator", "email": false},
+    {"id": 1, "name": "My Company", "email": false}
+  ]
+}

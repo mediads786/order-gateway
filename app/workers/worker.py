@@ -9,12 +9,13 @@ import httpx
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.adapters import AdapterLine, AdapterOrder, ErpAdapter, NonRetryableAdapterError, get_adapter
+from app.adapters.odoo import OdooAdapter
 from app.db.models import AuditEvent, Job, Order
 from app.db.session import SessionLocal
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-ERP_BASE_URL = os.environ["ERP_BASE_URL"].rstrip("/")
 ERP_TIMEOUT_SECONDS = float(os.getenv("ERP_TIMEOUT_SECONDS", "5"))
 WORKER_POLL_INTERVAL_SECONDS = float(os.getenv("WORKER_POLL_INTERVAL_SECONDS", "1"))
 RETRY_BASE_SECONDS = float(os.getenv("RETRY_BASE_SECONDS", "2"))
@@ -33,6 +34,13 @@ def classify_failure(
     error: Exception | None = None,
     invalid_response: bool = False,
 ) -> tuple[bool, str]:
+    if isinstance(error, NonRetryableAdapterError):
+        return False, error.reason
+    if isinstance(error, httpx.HTTPStatusError):
+        status_code = error.response.status_code
+        if status_code == 429 or status_code >= 500:
+            return True, f"http_{status_code}"
+        return False, "non_retryable"
     if isinstance(error, httpx.TransportError):
         return True, type(error).__name__
     if error is not None:
@@ -70,23 +78,24 @@ def claim_next_job(db: Session) -> Job | None:
     return job
 
 
-def _claim_one() -> tuple[uuid.UUID, uuid.UUID, dict] | None:
+def _claim_one() -> AdapterOrder | None:
     with SessionLocal.begin() as db:
         job = claim_next_job(db)
         if job is None:
             return None
         order = db.get(Order, job.order_id)
-        payload = {
-            "external_id": str(order.order_id),
-            "customer": {"name": order.customer_name, "phone": order.customer_phone, "email": order.customer_email},
-            "currency": order.currency,
-            "lines": [{"sku": line.sku, "qty": line.qty, "unit_price": str(line.unit_price)} for line in order.lines],
-            "total": str(order.total),
-        }
-        return job.job_id, order.order_id, payload
+        return AdapterOrder(
+            order_id=order.order_id,
+            job_id=job.job_id,
+            external_id=str(order.order_id),
+            customer={"name": order.customer_name, "phone": order.customer_phone, "email": order.customer_email},
+            currency=order.currency,
+            lines=[AdapterLine(sku=line.sku, qty=line.qty, unit_price=line.unit_price) for line in order.lines],
+            total=order.total,
+        )
 
 
-def _mark_done(job_id: uuid.UUID, order_id: uuid.UUID, erp_order_id: str) -> None:
+def _mark_done(job_id: uuid.UUID, order_id: uuid.UUID, erp_order_id: str, duplicate: bool = False) -> None:
     with SessionLocal.begin() as db:
         job = db.get(Job, job_id)
         order = db.get(Order, order_id)
@@ -96,9 +105,10 @@ def _mark_done(job_id: uuid.UUID, order_id: uuid.UUID, erp_order_id: str) -> Non
         job.updated_at = func.now()
         order.status = "CONFIRMED"
         order.erp_order_id = erp_order_id
-        db.add(AuditEvent(order_id=order_id, event_type="order.confirmed", details={
-            "erp_order_id": erp_order_id, "attempt": job.attempts,
-        }))
+        details = {"erp_order_id": erp_order_id, "attempt": job.attempts}
+        if duplicate:
+            details["duplicate"] = True
+        db.add(AuditEvent(order_id=order_id, event_type="order.confirmed", details=details))
 
 
 def _mark_failure(job_id: uuid.UUID, order_id: uuid.UUID, error: str, retryable: bool) -> None:
@@ -156,27 +166,22 @@ def recover_stale_jobs() -> int:
     return recovered
 
 
-def process_one() -> bool:
-    claimed = _claim_one()
-    if claimed is None:
+def process_one(adapter: ErpAdapter | None = None) -> bool:
+    selected_adapter = adapter or get_adapter()
+    order = _claim_one()
+    if order is None:
         return False
-    job_id, order_id, payload = claimed
-    status_code = None
+    job_id, order_id = order.job_id, order.order_id
     try:
-        response = httpx.post(f"{ERP_BASE_URL}/sales-orders", json=payload, timeout=ERP_TIMEOUT_SECONDS)
-        status_code = response.status_code
-        if status_code in (200, 201) or status_code == 409:
-            erp_order_id = response.json().get("erp_order_id")
-            if isinstance(erp_order_id, str) and erp_order_id:
-                _mark_done(job_id, order_id, erp_order_id)
-                return True
-            raise ValueError("ERP response did not include a valid erp_order_id")
-        response.raise_for_status()
-        raise ValueError(f"Unexpected ERP status {status_code}")
+        result = selected_adapter.create_sales_order(order)
+        if not isinstance(result.erp_order_id, str) or not result.erp_order_id:
+            raise ValueError("ERP adapter did not return a valid erp_order_id")
+        duplicate = result.duplicate and isinstance(selected_adapter, OdooAdapter)
+        _mark_done(job_id, order_id, result.erp_order_id, duplicate)
+        return True
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
-        retryable, _ = classify_failure(status_code=status_code, error=exc if status_code is None else None,
-                                        invalid_response=isinstance(exc, ValueError))
+        retryable, _ = classify_failure(invalid_response=True) if isinstance(exc, ValueError) else classify_failure(error=exc)
         logger.exception("ERP call failed job_id=%s order_id=%s", job_id, order_id)
         _mark_failure(job_id, order_id, error, retryable)
         return True
@@ -190,9 +195,15 @@ def run_until_idle() -> int:
 
 
 def run_forever() -> None:
+    adapter = get_adapter()
+    if os.getenv("ERP_ADAPTER", "mock").strip().lower() == "odoo" and 6 * ERP_TIMEOUT_SECONDS >= STALE_JOB_SECONDS:
+        logger.warning(
+            "Odoo call budget may exceed stale-job timeout: 6 * ERP_TIMEOUT_SECONDS=%s STALE_JOB_SECONDS=%s",
+            6 * ERP_TIMEOUT_SECONDS, STALE_JOB_SECONDS,
+        )
     while True:
         recover_stale_jobs()
-        if not process_one():
+        if not process_one(adapter):
             time.sleep(WORKER_POLL_INTERVAL_SECONDS)
 
 
