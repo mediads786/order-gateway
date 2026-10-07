@@ -210,7 +210,7 @@ $env:ODOO_LIVE = "1"
 
 ## What is verified and what is not
 
-- Automated test count: `__ tests` (fill in after running pytest).
+- Automated test count: `123 passed, 1 skipped (the opt-in live Odoo test, which also passed locally)`.
 - Odoo live smoke test: passed locally with the opt-in `ODOO_LIVE=1` setting.
 - Shopify live-store test: not yet done; mapping fixtures and signature behavior are tested locally.
 - Odoo API calls are documented in [docs/odoo-notes.md](docs/odoo-notes.md); the sale-order create flow should also be checked with the opt-in live smoke test for the Odoo instance in use.

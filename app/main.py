@@ -21,9 +21,11 @@ from app.services.shopify_webhooks import UnmappableShopifyOrder, map_shopify_or
 from app.admin.auth import admin_enabled
 from app.admin.routes import router as admin_router
 from app.services.retry import requeue_failed_order
+from app.governance.routes import router as governance_router
 app = FastAPI()
 logger = logging.getLogger(__name__)
 app.include_router(admin_router)
+app.include_router(governance_router)
 
 
 @app.middleware("http")

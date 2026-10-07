@@ -8,8 +8,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from sqlalchemy import func, select
 
 from app.admin.auth import COOKIE_NAME, authenticated, configured_token, session_cookie_value
-from app.admin.views import ORDER_STATES, PAGE_SIZE, login_page, order_detail_page, orders_page
-from app.db.models import AuditEvent, Job, Order, Shipment
+from app.admin.views import ORDER_STATES, PAGE_SIZE, login_page, order_detail_page, orders_page, workflow_events_page
+from app.db.models import AuditEvent, Job, Order, Shipment, WorkflowEvent
 from app.db.session import SessionLocal
 from app.services.retry import requeue_failed_order
 
@@ -135,3 +135,31 @@ def retry_order_admin(request: Request, order_id: str):
         return RedirectResponse("/admin/orders?msg=not_found", status_code=303)
     message = "requeued" if result == "requeued" else "not_dead"
     return RedirectResponse(f"/admin/orders/{parsed_id}?msg={message}", status_code=303)
+
+
+@router.get("/admin/workflow-events", response_class=HTMLResponse, include_in_schema=False)
+def list_workflow_events(request: Request, type: str = "", page: str = "1", refresh: str | None = None):
+    denied = _authorized(request)
+    if denied:
+        return denied
+    event_types = {
+        "workflow.requested", "workflow.denied", "workflow.rejected",
+        "workflow.executed", "workflow.not_executable", "workflow.failed",
+    }
+    event_filter = type if type in event_types else ""
+    try:
+        page_number = max(1, int(page))
+    except (TypeError, ValueError):
+        page_number = 1
+    with SessionLocal() as db:
+        query = select(WorkflowEvent)
+        if event_filter:
+            query = query.where(WorkflowEvent.event_type == event_filter)
+            total = db.scalar(select(func.count()).select_from(WorkflowEvent).where(WorkflowEvent.event_type == event_filter)) or 0
+        else:
+            total = db.scalar(select(func.count()).select_from(WorkflowEvent)) or 0
+        rows = db.scalars(
+            query.order_by(WorkflowEvent.created_at.desc(), WorkflowEvent.event_id.desc())
+            .offset((page_number - 1) * PAGE_SIZE).limit(PAGE_SIZE)
+        ).all()
+    return HTMLResponse(workflow_events_page(rows, event_filter, page_number, total, _refresh_value(refresh)))

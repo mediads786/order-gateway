@@ -28,7 +28,7 @@ def page(title: str, content: str, *, refresh: bool = True, paused: bool = False
     return (
         "<!doctype html><html><head><meta charset=\"utf-8\">"
         f"<title>{safe(title)}</title>{refresh_tag}<style>{style}</style></head><body>"
-        "<nav><a href=\"/admin/orders\">Orders</a>"
+        "<nav><a href=\"/admin/orders\">Orders</a><a href=\"/admin/workflow-events\">Workflow events</a>"
         f"<a href=\"?refresh={refresh_value}\">{refresh_label}</a>"
         "<form method=\"post\" action=\"/admin/logout\"><button>Logout</button></form></nav>"
         f"{content}</body></html>"
@@ -154,3 +154,55 @@ def order_detail_page(
         "Order detail", f"<h1>Order detail</h1>{notice}{retry}{header}{lines_section}{job_section}{shipment_section}{audit}",
         refresh=refresh, paused=not refresh,
     )
+
+
+def workflow_events_page(
+    rows: list[AuditEvent], event_type: str, page_number: int, total: int, refresh: bool,
+) -> str:
+    table_rows = []
+    for event in rows:
+        order_id = ""
+        if event.order_id is not None:
+            full_order_id = str(event.order_id)
+            order_id = f'<a href="/admin/orders/{safe(full_order_id)}">{safe(full_order_id[:8])}</a>'
+        details = json.dumps(event.detail, indent=2, sort_keys=True, ensure_ascii=False)
+        table_rows.append(
+            "<tr>"
+            f"<td>{safe(utc_text(event.created_at))}</td>"
+            f"<td>{safe(str(event.request_id)[:8])}</td><td>{safe(event.actor_name)}</td>"
+            f"<td>{safe(event.role)}</td><td>{safe(event.workflow)}</td>"
+            f"<td>{safe(event.event_type)}</td><td>{safe(event.http_status)}</td>"
+            f"<td>{order_id}</td><td><pre>{safe(details)}</pre></td></tr>"
+        )
+    if not table_rows:
+        table_rows.append('<tr><td colspan="9">No workflow events found.</td></tr>')
+    event_types = (
+        "workflow.requested", "workflow.denied", "workflow.rejected",
+        "workflow.executed", "workflow.not_executable", "workflow.failed",
+    )
+    filters = ['<a href="/admin/workflow-events">ALL</a>']
+    filters.extend(
+        f'<a href="/admin/workflow-events?{urlencode({"type": item})}">{safe(item)}</a>'
+        for item in event_types
+    )
+    previous = ""
+    if page_number > 1:
+        params = {"page": page_number - 1}
+        if event_type:
+            params["type"] = event_type
+        previous = f'<a href="/admin/workflow-events?{urlencode(params)}">Prev</a> '
+    next_link = ""
+    if page_number * PAGE_SIZE < total:
+        params = {"page": page_number + 1}
+        if event_type:
+            params["type"] = event_type
+        next_link = f'<a href="/admin/workflow-events?{urlencode(params)}">Next</a>'
+    body = (
+        "<h1>Workflow events</h1><p>" + " | ".join(filters) + "</p>"
+        + f"<p>Filter: {safe(event_type or 'ALL')}</p>"
+        + "<table><thead><tr><th>Time (UTC)</th><th>Request</th><th>Actor</th><th>Role</th>"
+        "<th>Workflow</th><th>Event</th><th>HTTP</th><th>Order</th><th>Detail</th>"
+        "</tr></thead><tbody>" + "".join(table_rows) + "</tbody></table>"
+        + f"<p>{previous}Page {page_number}{' ' + next_link if next_link else ''}</p>"
+    )
+    return page("Workflow events", body, refresh=refresh, paused=not refresh)

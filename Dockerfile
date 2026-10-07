@@ -3,6 +3,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
+COPY scripts ./scripts
 COPY mock_erp ./mock_erp
 COPY migrations ./migrations
 COPY alembic.ini .
