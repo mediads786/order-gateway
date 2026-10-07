@@ -54,7 +54,7 @@ stateDiagram-v2
   QUEUED --> PROCESSING: worker claim
   PROCESSING --> CONFIRMED: ERP success
   PROCESSING --> RETRYING: temporary failure
-  RETRYING --> QUEUED: retry due
+  RETRYING --> PROCESSING: retry due
   PROCESSING --> FAILED_DEAD: permanent failure or attempts exhausted
   FAILED_DEAD --> QUEUED: manual retry
 ```
