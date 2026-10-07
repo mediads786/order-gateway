@@ -2,7 +2,7 @@
 
 An idempotent order intake and delivery service that stores orders in PostgreSQL, retries ERP delivery, and provides an operations view.
 
-<!-- TODO: add demo.gif after recording -->
+![Demo: ERP failure, retries, recovery](docs/demo.gif)
 
 ## What it does
 
