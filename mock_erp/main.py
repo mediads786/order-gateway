@@ -16,6 +16,7 @@ fault_fail_rate = 0.0
 fault_latency_ms = 0
 sales_orders: dict[str, dict] = {}
 external_ids: dict[str, str] = {}
+stock_adjustments: dict[str, str] = {}
 
 
 class SalesOrderInput(BaseModel):
@@ -30,6 +31,13 @@ class FaultInput(BaseModel):
     mode: Literal["none", "error_500", "rate_limit_429", "error_422", "timeout", "slow"] = "none"
     fail_rate: float = Field(default=0, ge=0, le=1)
     latency_ms: int = Field(default=0, ge=0)
+
+
+class StockAdjustmentInput(BaseModel):
+    reference: str
+    sku: str
+    qty_delta: int = Field(strict=True, ne=0)
+    reason: str
 
 
 @app.post("/sales-orders")
@@ -80,6 +88,36 @@ def get_sales_order(erp_order_id: str):
     return order
 
 
+@app.post("/stock-adjustments")
+async def adjust_stock(adjustment: StockAdjustmentInput):
+    with lock:
+        mode = fault_mode
+        fail_rate = fault_fail_rate
+        latency_ms = fault_latency_ms
+    if latency_ms:
+        await asyncio.sleep(latency_ms / 1000)
+    if mode == "error_500":
+        raise HTTPException(status_code=500, detail="Injected ERP error")
+    if mode == "rate_limit_429":
+        raise HTTPException(status_code=429, detail="Injected ERP rate limit")
+    if mode == "error_422":
+        raise HTTPException(status_code=422, detail="Injected ERP validation error")
+    if mode == "timeout":
+        await asyncio.sleep(10)
+        raise HTTPException(status_code=504, detail="Injected ERP timeout")
+    if mode == "slow":
+        await asyncio.sleep(1)
+    if random.random() < fail_rate:
+        raise HTTPException(status_code=500, detail="Injected random ERP error")
+    with lock:
+        existing_id = stock_adjustments.get(adjustment.reference)
+        if existing_id:
+            return {"adjustment_id": existing_id, "applied": False}
+        adjustment_id = str(uuid.uuid4())
+        stock_adjustments[adjustment.reference] = adjustment_id
+        return {"adjustment_id": adjustment_id, "applied": True}
+
+
 @app.post("/admin/faults")
 def set_faults(faults: FaultInput):
     global fault_mode, fault_fail_rate, fault_latency_ms
@@ -99,4 +137,5 @@ def reset():
         fault_latency_ms = 0
         sales_orders.clear()
         external_ids.clear()
+        stock_adjustments.clear()
     return {"status": "reset"}

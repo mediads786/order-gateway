@@ -70,9 +70,9 @@ $Api = "http://localhost:8002"
 function Show-HttpResult($Method, $Uri, $Headers, $Body = $null) {
   try {
     if ($null -eq $Body) {
-      $result = Invoke-WebRequest -Method $Method -Uri $Uri -Headers $Headers
+      $result = Invoke-WebRequest -UseBasicParsing -Method $Method -Uri $Uri -Headers $Headers
     } else {
-      $result = Invoke-WebRequest -Method $Method -Uri $Uri -Headers $Headers -ContentType "application/json" -Body $Body
+      $result = Invoke-WebRequest -UseBasicParsing -Method $Method -Uri $Uri -Headers $Headers -ContentType "application/json" -Body $Body
     }
     "HTTP $([int]$result.StatusCode)"
     $result.Content
@@ -95,4 +95,72 @@ Show-HttpResult POST "$Api/workflows/adjust_stock/requests" @{ "X-API-Key" = $Op
 Start-Process "$Api/admin/workflow-events"
 ```
 
-Expected sequence: registry `200`, operator order request `201`, approver request `403`, registered stock adjustment `501`; then view the corresponding requested, denied, executed, and not-executable entries in the admin audit page. The adjustment is recorded as non-executable and does not change stock.
+Expected sequence: registry `200`, operator order request `201`, approver request `403`, and stock adjustment request `202` with no adapter call. View the requested, denied, executed, and approval-requested entries in the admin audit page.
+
+## Approval demo (about 90 seconds)
+
+Use the default `APPROVAL_THRESHOLD=1000.00` and a running Compose stack migrated to `0007`. Create three distinct keys; each key is printed once. This script uses Windows PowerShell 5.1-compatible `WebException` handling and prints HTTP error status and body.
+
+### Before you start
+
+This demo needs three active API keys: an operator (`$OperatorKey`), an approver (`$ApproverKey`), and an admin or second approver (`$SecondKey`). List the key names, roles, and active states with `docker compose exec api python -m scripts.api_keys list`; the list does not show key values. Deactivated keys return 401.
+
+```powershell
+\.venv\Scripts\python.exe -m scripts.api_keys create --name approval-operator --role operator
+$OperatorKey = Read-Host "Paste operator key"
+\.venv\Scripts\python.exe -m scripts.api_keys create --name approval-approver --role approver
+$ApproverKey = Read-Host "Paste approver key"
+\.venv\Scripts\python.exe -m scripts.api_keys create --name approval-admin --role admin
+$SecondKey = Read-Host "Paste admin or second approver key"
+$Api = "http://localhost:8002"
+
+function Send-Gateway($Method, $Path, $Key, $Body = $null) {
+  $Headers = @{ "X-API-Key" = $Key }
+  try {
+    if ($null -eq $Body) {
+      $Response = Invoke-WebRequest -UseBasicParsing -Method $Method -Uri "$Api$Path" -Headers $Headers
+    } else {
+      $Response = Invoke-WebRequest -UseBasicParsing -Method $Method -Uri "$Api$Path" -Headers $Headers -ContentType "application/json" -Body $Body
+    }
+    $StatusCode = [int]$Response.StatusCode
+    $Content = $Response.Content
+  } catch [System.Net.WebException] {
+    $HttpResponse = $_.Exception.Response
+    if ($null -eq $HttpResponse) { throw }
+    $StatusCode = [int]$HttpResponse.StatusCode
+    $Reader = [IO.StreamReader]::new($HttpResponse.GetResponseStream())
+    try { $Content = $Reader.ReadToEnd() } finally { $Reader.Dispose(); $HttpResponse.Dispose() }
+  }
+  Write-Host "HTTP $StatusCode"
+  Write-Host $Content
+  return $Content
+}
+
+$LargeOrder = @{ source = "manual"; external_ref = "approval-demo-1"; customer = @{ name = "Approval Demo"; email = "approval-demo@example.com" }; currency = "USD"; lines = @(@{ sku = "ABC"; qty = 100; unit_price = "25.00" }) } | ConvertTo-Json -Depth 8 -Compress
+$OrderRequest = @{ input = ($LargeOrder | ConvertFrom-Json) } | ConvertTo-Json -Depth 10 -Compress
+$OrderResult = (Send-Gateway POST "/workflows/create_order/requests" $OperatorKey $OrderRequest) | ConvertFrom-Json
+$ApprovalId = $OrderResult.approval_id
+Start-Process "$Api/admin/orders/$($OrderResult.result.order_id)"
+Start-Sleep -Seconds 3
+Send-Gateway POST "/approvals/$ApprovalId/decision" $OperatorKey '{"decision":"approve"}'
+$Pending = Invoke-RestMethod -Uri "$Api/approvals?status=PENDING" -Headers @{ "X-API-Key" = $ApproverKey }
+$Pending | Format-Table approval_id, workflow, status, requested_by_name, summary
+$Approve = '{"decision":"approve","reason":"Reviewed by approver"}'
+Send-Gateway POST "/approvals/$ApprovalId/decision" $ApproverKey $Approve
+Start-Sleep -Seconds 3
+
+$LargeOrder2 = $LargeOrder | ConvertFrom-Json
+$LargeOrder2.external_ref = "approval-demo-2"
+$RejectRequest = @{ input = $LargeOrder2 } | ConvertTo-Json -Depth 10 -Compress
+$RejectResult = (Send-Gateway POST "/workflows/create_order/requests" $OperatorKey $RejectRequest) | ConvertFrom-Json
+$RejectId = $RejectResult.approval_id
+Send-Gateway POST "/approvals/$RejectId/decision" $SecondKey '{"decision":"reject","reason":"Demo rejection"}'
+
+$StockRequest = @{ input = @{ sku = "ABC"; qty_delta = 1; reason = "Approval demo adjustment" } } | ConvertTo-Json -Depth 5 -Compress
+$StockResult = (Send-Gateway POST "/workflows/adjust_stock/requests" $OperatorKey $StockRequest) | ConvertFrom-Json
+Send-Gateway POST "/approvals/$($StockResult.approval_id)/decision" $SecondKey '{"decision":"approve","reason":"Approved stock correction"}'
+Start-Process "$Api/admin/workflow-events"
+Start-Process "$Api/admin/approvals"
+```
+
+The first request returns `202 PENDING_APPROVAL`; no job exists, so the worker leaves it waiting. The operator decision returns `403`, then the approver's decision queues the order and the worker delivers it. The admin rejects the second large order, which becomes `CANCELLED`. The admin then approves the operator's stock request; the mock ERP has no stock-adjustment listing endpoint, so verify it in `workflow.executed`. Open `/admin/workflow-events` and `/admin/approvals` after signing into the admin page to inspect the audit trail.

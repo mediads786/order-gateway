@@ -59,6 +59,10 @@ stateDiagram-v2
   [*] --> RECEIVED: valid intake
   [*] --> REJECTED: invalid intake
   RECEIVED --> QUEUED: job created
+  RECEIVED --> PENDING_APPROVAL: governed total over threshold
+  PENDING_APPROVAL --> APPROVED: approver decision
+  APPROVED --> QUEUED: approval commits job
+  PENDING_APPROVAL --> CANCELLED: rejected approval
   QUEUED --> PROCESSING: worker claim
   PROCESSING --> CONFIRMED: ERP success
   PROCESSING --> RETRYING: temporary failure
@@ -114,7 +118,7 @@ The test fixture reads `TEST_DATABASE_URL` from the environment or `.env`, creat
 
 ## Demo
 
-Follow the [3-minute operations demo](docs/demo.md) or the [about-60-second governance demo](docs/demo.md#governance-demo-about-60-seconds).
+Follow the [3-minute operations demo](docs/demo.md), the [about-60-second governance demo](docs/demo.md#governance-demo-about-60-seconds), or the [about-90-second approval demo](docs/demo.md#approval-demo-about-90-seconds).
 
 ## Admin pages
 
@@ -126,7 +130,23 @@ The admin has one shared identity, so an admin retry audit event cannot identify
 
 Migration `0006_workflow_governance` adds database-backed API keys and append-only `workflow_events`. API keys are stored as SHA-256 hashes; the raw key is printed only at creation. `operator`, `approver`, and `admin` are the supported roles. Send the key in `X-API-Key`; callers cannot select their own role. `GET /workflows` returns the registered schemas. `POST /workflows/{name}/requests` accepts `{"input": {...}}`, and executable order intake also requires `Idempotency-Key`. Responses include a `request_id` in both the JSON body and `X-Request-Id` header. Unauthorized calls do not create workflow events; authenticated denials and outcomes are audited without storing raw request bodies or API keys.
 
-The registry contains `create_order` (low risk, executable), `adjust_stock` (high risk, registered but not executable in this module), and `cancel_order` (medium risk, registered but not executable in this module). Operators and admins can request these workflows; approvers can inspect the registry but cannot request them. Approval does not execute an operation in this module.
+The registry contains `create_order` (low risk, executable), `adjust_stock` (high risk, executable after approval), and `cancel_order` (medium risk, not executable; it returns `501`). Operators and admins may request these workflows. Only approvers and admins may decide, and a key cannot decide its own request.
+
+### Approvals
+
+Governed `create_order` requests whose computed `Decimal` total is strictly greater than `APPROVAL_THRESHOLD` are stored as `PENDING_APPROVAL` without a job. The default threshold is `1000.00`; equality does not require approval, and currency is ignored by the comparison. A different approver or admin can approve, which queues the order, or reject with a reason, which sets it to `CANCELLED`. Every `adjust_stock` request waits for approval before the adapter is called. A failed stock adjustment is recorded as `EXECUTION_FAILED` and is not retried automatically.
+
+The API endpoints are `GET /approvals?status=PENDING&page=1`, `GET /approvals/{approval_id}`, and `POST /approvals/{approval_id}/decision`. Approvers and admins can see all approvals; operators can see only requests they made. The admin approval page is read-only; decisions require an API key so requester identity and the self-approval rule remain enforceable.
+
+```powershell
+$ApproverKey = Read-Host "Approver API key"
+$Pending = Invoke-RestMethod -Uri "http://localhost:8002/approvals?status=PENDING" -Headers @{ "X-API-Key" = $ApproverKey }
+$ApprovalId = $Pending[0].approval_id
+$Decision = '{"decision":"approve","reason":"Reviewed"}'
+Invoke-RestMethod -Method Post -Uri "http://localhost:8002/approvals/$ApprovalId/decision" -Headers @{ "X-API-Key" = $ApproverKey } -ContentType "application/json" -Body $Decision
+```
+
+New order audit events are `order.pending_approval`, `order.approved`, and `order.cancelled`. Workflow audit events include `workflow.approval_requested`, `workflow.approved`, and `workflow.approval_rejected`; existing `workflow.executed`, `workflow.denied`, and `workflow.failed` events record the result or refusal.
 
 Create, list, or deactivate keys from the repository root after migrations have run:
 
@@ -231,6 +251,7 @@ $env:ODOO_LIVE = "1"
 | `SHOPIFY_WEBHOOK_SECRET` | empty | Shopify webhook HMAC secret | Yes |
 | `SHIPMENT_WEBHOOK_SECRET` | empty | Shipment HMAC secret | Yes |
 | `ADMIN_TOKEN` | empty | Admin login token; minimum 16 characters | Yes |
+| `APPROVAL_THRESHOLD` | `1000.00` | Governed order total above which approval is required | No |
 | `ODOO_BASE_URL` | empty | Odoo JSON-2 base URL | No |
 | `ODOO_DB` | `gateway` | Odoo database header | No |
 | `ODOO_API_KEY` | empty | Odoo bearer API key | Yes |
@@ -243,8 +264,8 @@ $env:ODOO_LIVE = "1"
 
 ## What is verified and what is not
 
-- Automated test count: `123 passed, 1 skipped (the opt-in live Odoo test, which also passed locally)`.
-- Odoo live smoke test: passed locally with the opt-in `ODOO_LIVE=1` setting.
+- Automated test count: `TODO — fill in after running pytest`.
+- The opt-in Odoo smoke test requires a running seeded Odoo instance and `ODOO_LIVE=1`.
 - Shopify live-store test: not yet done; mapping fixtures and signature behavior are tested locally.
 - Odoo API calls are documented in [docs/odoo-notes.md](docs/odoo-notes.md); the sale-order create flow should also be checked with the opt-in live smoke test for the Odoo instance in use.
 
@@ -261,13 +282,17 @@ $env:ODOO_LIVE = "1"
 - Shipments are synchronous and use one warehouse.
 - Order currency must match `ODOO_EXPECTED_CURRENCY`.
 - Odoo Online plans may restrict external API access.
+- Existing `POST /orders`, Shopify, shipment, and retry endpoints bypass approvals; only governed workflows use the approval rules.
+- The threshold ignores currency, pending approvals do not expire, and decisions are available through the API only.
+- Failed `adjust_stock` approval executions are not retried automatically; a requester must submit a new request.
+- Approval state commits and workflow audit events use separate transactions, leaving a small crash window where the state is committed before its corresponding workflow event.
 - Admin uses one shared token, has no per-user identity and no login rate limiting.
 - The API retry endpoint has no authentication in v1.
 - The admin cookie is not marked `Secure` over plain HTTP.
 
 ## Roadmap
 
-- Layer 2: workflow registry and API-key roles are implemented; registered adjustment and cancellation workflows remain non-executable.
+- Layer 2: workflow registry, roles, approvals, and governed stock adjustment are implemented.
 - Layer 3: natural-language proposals that can only propose changes.
 
 ## Project layout

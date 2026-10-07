@@ -49,10 +49,11 @@ class OdooAdapter:
         order_id: str | None = None,
         job_id: str | None = None,
         shipment_id: str | None = None,
+        approval_id: str | None = None,
     ) -> Any:
         logger.info(
-            "Odoo call order_id=%s job_id=%s shipment_id=%s model=%s method=%s",
-            order_id, job_id, shipment_id, model, method,
+            "Odoo call order_id=%s job_id=%s shipment_id=%s approval_id=%s model=%s method=%s",
+            order_id, job_id, shipment_id, approval_id, model, method,
         )
         response = self.client.post(
             f"{self.base_url}/json/2/{model}/{method}", json=arguments, timeout=self.timeout,
@@ -66,8 +67,8 @@ class OdooAdapter:
             message = str(error_body.get("message", "")) if isinstance(error_body, dict) else ""
             message = (message or f"Odoo returned HTTP {response.status_code}")[:500]
             logger.error(
-                "Odoo error order_id=%s job_id=%s shipment_id=%s model=%s method=%s status=%s name=%s message=%s",
-                order_id, job_id, shipment_id, model, method, response.status_code, name, message,
+                "Odoo error order_id=%s job_id=%s shipment_id=%s approval_id=%s model=%s method=%s status=%s name=%s message=%s",
+                order_id, job_id, shipment_id, approval_id, model, method, response.status_code, name, message,
             )
             if response.status_code in (401, 403):
                 raise NonRetryableAdapterError("odoo_auth", f"odoo_auth: {message}")
@@ -269,6 +270,73 @@ class OdooAdapter:
             self._apply_counted_quantity(quant_id, float(on_hand - line.qty), marker, shipment_id=shipment_id)
         return f"GW-SHIP:{shipment_id}"
 
+    def adjust_stock(self, reference: str, sku: str, qty_delta: int, reason: str) -> dict:
+        approval_id = reference.split(":", 2)[1] if reference.startswith("GW-ADJ:") else reference
+        warehouse = self._call(
+            "stock.warehouse", "search_read",
+            {"domain": [["code", "=", self.warehouse_code]], "fields": ["id", "lot_stock_id"], "limit": 1},
+            approval_id=approval_id,
+        )
+        if not isinstance(warehouse, list) or not warehouse or not isinstance(warehouse[0], dict):
+            raise NonRetryableAdapterError("warehouse_not_found", f"unknown_warehouse:{self.warehouse_code}")
+        location_ref = warehouse[0].get("lot_stock_id")
+        if not isinstance(location_ref, list) or not location_ref or type(location_ref[0]) is not int:
+            raise ValueError("Odoo warehouse response omitted its stock location")
+        location_id = location_ref[0]
+        products = self._call(
+            "product.product", "search_read",
+            {"domain": [["default_code", "=", sku], ["active", "=", True]],
+             "fields": ["id", "default_code"], "limit": 2},
+            approval_id=approval_id,
+        )
+        if not isinstance(products, list) or any(not isinstance(row, dict) for row in products):
+            raise ValueError("Odoo product.product/search_read returned an invalid response")
+        if not products:
+            raise NonRetryableAdapterError(f"unknown_sku:{sku}", f"unknown_sku:{sku}")
+        if len(products) > 1:
+            raise NonRetryableAdapterError(f"ambiguous_sku:{sku}", f"ambiguous_sku:{sku}")
+        product_id = products[0].get("id")
+        if type(product_id) is not int:
+            raise ValueError(f"Odoo product lookup omitted id for {sku}")
+
+        prior_moves = self._call(
+            "stock.move", "search_read",
+            {"domain": [["reference", "=", reference]], "fields": ["id", "reference"], "limit": 1},
+            approval_id=approval_id,
+        )
+        if not isinstance(prior_moves, list) or any(not isinstance(row, dict) for row in prior_moves):
+            raise ValueError("Odoo stock.move/search_read returned an invalid response")
+        if prior_moves:
+            return {"adjustment_id": reference, "applied": False}
+
+        quants = self._call(
+            "stock.quant", "search_read",
+            {"domain": [["product_id", "=", product_id], ["location_id", "=", location_id]],
+             "fields": ["id", "quantity"], "limit": 2},
+            approval_id=approval_id,
+        )
+        if not isinstance(quants, list) or any(not isinstance(row, dict) for row in quants):
+            raise ValueError("Odoo stock.quant/search_read returned an invalid response")
+        if len(quants) > 1:
+            raise NonRetryableAdapterError(f"ambiguous_quant:{sku}", f"multiple stock quants for {sku}")
+        quant_id = quants[0].get("id") if quants else None
+        on_hand = Decimal(str(quants[0].get("quantity", 0))) if quants else Decimal("0")
+        if quant_id is not None and type(quant_id) is not int:
+            raise ValueError(f"Odoo stock quant lookup omitted id for {sku}")
+        new_quantity = on_hand + Decimal(qty_delta)
+        if new_quantity < 0:
+            raise NonRetryableAdapterError("insufficient_stock", f"insufficient_stock:{sku}")
+
+        self._apply_counted_quantity(
+            quant_id,
+            float(new_quantity),
+            reference,
+            product_id=product_id if quant_id is None else None,
+            location_id=location_id if quant_id is None else None,
+            approval_id=approval_id,
+        )
+        return {"adjustment_id": reference, "applied": True}
+
     def set_opening_stock(self, sku: str, quantity: int = 100) -> None:
         warehouse = self._call(
             "stock.warehouse", "search_read",
@@ -332,6 +400,7 @@ class OdooAdapter:
         product_id: int | None = None,
         location_id: int | None = None,
         shipment_id: str | None = None,
+        approval_id: str | None = None,
     ) -> None:
         if quant_id is None:
             created = self._call(
@@ -340,6 +409,7 @@ class OdooAdapter:
                                 "inventory_quantity": quantity}],
                  "context": {"inventory_mode": True}},
                 shipment_id=shipment_id,
+                approval_id=approval_id,
             )
             quant_id = self._created_id(created, "stock.quant/create")
         else:
@@ -348,6 +418,7 @@ class OdooAdapter:
                 {"ids": [quant_id], "vals": {"inventory_quantity": quantity},
                  "context": {"inventory_mode": True}},
                 shipment_id=shipment_id,
+                approval_id=approval_id,
             )
             if written is not True:
                 raise ValueError("Odoo stock.quant/write returned an invalid response")
@@ -355,11 +426,13 @@ class OdooAdapter:
             "stock.quant", "action_apply_inventory",
             {"ids": [quant_id], "context": {"inventory_mode": True, "inventory_name": marker}},
             shipment_id=shipment_id,
+            approval_id=approval_id,
         )
         updated = self._call(
             "stock.quant", "search_read",
             {"domain": [["id", "=", quant_id]], "fields": ["quantity"], "limit": 1},
             shipment_id=shipment_id,
+            approval_id=approval_id,
         )
         if not isinstance(updated, list) or not updated or not isinstance(updated[0], dict):
             raise ValueError("Odoo stock.quant/search_read returned an invalid response after adjustment")

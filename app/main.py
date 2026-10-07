@@ -22,10 +22,14 @@ from app.admin.auth import admin_enabled
 from app.admin.routes import router as admin_router
 from app.services.retry import requeue_failed_order
 from app.governance.routes import router as governance_router
+from app.governance.approvals import router as approvals_router
+from app.proposals.routes import router as proposals_router
 app = FastAPI()
 logger = logging.getLogger(__name__)
 app.include_router(admin_router)
 app.include_router(governance_router)
+app.include_router(approvals_router)
+app.include_router(proposals_router)
 
 
 @app.middleware("http")

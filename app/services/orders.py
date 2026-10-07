@@ -2,13 +2,15 @@ import hashlib
 import json
 import logging
 from datetime import timezone
+from dataclasses import dataclass
 from decimal import Decimal
+import uuid
 
 from pydantic import ValidationError
 from sqlalchemy import text
 
 from app.core.schemas import OrderInput
-from app.db.models import AuditEvent, IdempotencyKey, Job, Order, OrderLine
+from app.db.models import Approval, AuditEvent, IdempotencyKey, Job, Order, OrderLine
 from app.db.session import SessionLocal
 
 logger = logging.getLogger(__name__)
@@ -16,6 +18,28 @@ logger = logging.getLogger(__name__)
 
 class NonFiniteJSON(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class HoldPolicy:
+    threshold: Decimal
+    request_id: uuid.UUID
+    requester_key_id: uuid.UUID
+    requester_name: str
+
+
+def create_queued_job(db, order: Order) -> Job:
+    job = Job(order_id=order.order_id, status="QUEUED", attempts=0)
+    db.add(job)
+    db.add(AuditEvent(order_id=order.order_id, event_type="order.queued", details={}))
+    db.flush()
+    return job
+
+
+def _replay_status(status_code: int) -> int:
+    if status_code in (202, 422):
+        return status_code
+    return 200
 
 
 def _reject_constant(value: str) -> None:
@@ -73,7 +97,7 @@ def _rejected_order(payload: object, reasons: list[dict], key: str, digest: str)
         if previous:
             if previous.request_hash != digest:
                 return 409, {"detail": "Idempotency-Key was used with a different request body"}
-            return (422 if previous.status_code == 422 else 200), previous.response_json
+            return _replay_status(previous.status_code), previous.response_json
         customer = payload.get("customer") if isinstance(payload, dict) else None
         customer = customer if isinstance(customer, dict) else {}
         order = Order(source=_optional_text(payload.get("source"), 20) if isinstance(payload, dict) else None,
@@ -98,7 +122,9 @@ def _validation_reasons(exc: ValidationError) -> list[dict]:
     return [{"field": ".".join(str(part) for part in error["loc"]), "reason": error["msg"]} for error in exc.errors()]
 
 
-def submit_order(raw_body: bytes, idempotency_key: str) -> tuple[int, dict]:
+def submit_order(
+    raw_body: bytes, idempotency_key: str, *, hold: HoldPolicy | None = None,
+) -> tuple[int, dict]:
     try:
         payload = json.loads(raw_body, parse_constant=_reject_constant)
     except NonFiniteJSON as exc:
@@ -127,22 +153,44 @@ def submit_order(raw_body: bytes, idempotency_key: str) -> tuple[int, dict]:
         if previous:
             if previous.request_hash != digest:
                 return 409, {"detail": "Idempotency-Key was used with a different request body"}
-            return (422 if previous.status_code == 422 else 200), previous.response_json
+            return _replay_status(previous.status_code), previous.response_json
         total = sum((line.unit_price * line.qty for line in order_data.lines), Decimal("0"))
+        requires_approval = hold is not None and total > hold.threshold
+        approval_id = uuid.uuid4() if requires_approval else None
         order = Order(source=order_data.source, external_ref=order_data.external_ref,
                       customer_name=order_data.customer.name, customer_phone=order_data.customer.phone,
                       customer_email=str(order_data.customer.email) if order_data.customer.email else None,
-                      currency=order_data.currency.upper(), total=total, status="RECEIVED", raw_payload=payload,
+                      currency=order_data.currency.upper(), total=total,
+                      status="PENDING_APPROVAL" if requires_approval else "RECEIVED", raw_payload=payload,
                       lines=[OrderLine(sku=line.sku, qty=line.qty, unit_price=line.unit_price) for line in order_data.lines])
         db.add(order)
         db.flush()
         db.add(AuditEvent(order_id=order.order_id, event_type="order.received", details={}))
         db.flush()
-        db.add(Job(order_id=order.order_id, status="QUEUED", attempts=0))
-        db.add(AuditEvent(order_id=order.order_id, event_type="order.queued", details={}))
-        db.flush()
+        response_status = 201
+        if requires_approval:
+            approval = Approval(
+                approval_id=approval_id,
+                request_id=hold.request_id,
+                workflow="create_order",
+                status="PENDING",
+                order_id=order.order_id,
+                requested_by_key_id=hold.requester_key_id,
+                requested_by_name=hold.requester_name,
+            )
+            db.add(approval)
+            db.add(AuditEvent(
+                order_id=order.order_id,
+                event_type="order.pending_approval",
+                details={"approval_id": str(approval_id)},
+            ))
+            response_status = 202
+        else:
+            create_queued_job(db, order)
         response_body = serialize_order(order)
+        if approval_id is not None:
+            response_body["approval_id"] = str(approval_id)
         db.add(IdempotencyKey(key=idempotency_key, request_hash=digest, response_json=response_body,
-                              status_code=201, order_id=order.order_id))
+                              status_code=response_status, order_id=order.order_id))
         logger.info("Received order_id=%s", order.order_id)
-        return 201, response_body
+        return response_status, response_body

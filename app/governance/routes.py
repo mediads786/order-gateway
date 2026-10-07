@@ -1,7 +1,9 @@
 import hashlib
 import json
 import logging
+import os
 import uuid
+from decimal import Decimal, InvalidOperation
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -11,7 +13,7 @@ from starlette.concurrency import run_in_threadpool
 from app.governance.audit import write_event
 from app.governance.keys import authenticate_api_key
 from app.governance.registry import WORKFLOWS, can_request
-from app.services.orders import submit_order
+from app.services.orders import HoldPolicy, submit_order
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -45,6 +47,17 @@ def _record_for_actor(
     )
 
 
+async def _record(
+    api_key, request_id: uuid.UUID, workflow: str, input_hash: str,
+    event_type: str, status: int | None = None, order_id: uuid.UUID | None = None,
+    detail: dict | None = None,
+) -> None:
+    await run_in_threadpool(
+        _record_for_actor, api_key, request_id, workflow, input_hash,
+        event_type, status, order_id, detail,
+    )
+
+
 def _validation_detail(exc: ValidationError) -> dict:
     return {
         "reasons": [
@@ -67,6 +80,8 @@ def list_workflows(request: Request):
             "risk": workflow.risk,
             "request_roles": list(workflow.request_roles),
             "executable": workflow.executable,
+            "approval": workflow.approval,
+            "decision_roles": list(workflow.decision_roles),
             "input_schema": workflow.input_model.model_json_schema(),
         }
         for workflow in WORKFLOWS.values()
@@ -76,7 +91,7 @@ def list_workflows(request: Request):
 @router.post("/workflows/{name}/requests")
 async def request_workflow(request: Request, name: str):
     raw_body = await request.body()
-    api_key = authenticate_api_key(request.headers.get("X-API-Key"))
+    api_key = await run_in_threadpool(authenticate_api_key, request.headers.get("X-API-Key"))
     if api_key is None:
         logger.warning("Rejected unauthenticated workflow request")
         return JSONResponse(status_code=401, content={"error": "unauthorized"})
@@ -85,69 +100,146 @@ async def request_workflow(request: Request, name: str):
     input_hash = _input_hash(raw_body)
     workflow = WORKFLOWS.get(name)
     if workflow is None:
-        _record_for_actor(api_key, request_id, name, input_hash, "workflow.denied", 404,
-                          detail={"reason": "unknown_workflow"})
+        await _record(api_key, request_id, name, input_hash, "workflow.denied", 404,
+                      detail={"reason": "unknown_workflow"})
         return _response(404, {"error": "unknown_workflow", "request_id": str(request_id)}, request_id)
     if not can_request(api_key.role, name):
-        _record_for_actor(api_key, request_id, name, input_hash, "workflow.denied", 403,
-                          detail={"reason": "forbidden"})
+        await _record(api_key, request_id, name, input_hash, "workflow.denied", 403,
+                      detail={"reason": "forbidden"})
         return _response(403, {"error": "forbidden", "request_id": str(request_id)}, request_id)
 
-    _record_for_actor(api_key, request_id, name, input_hash, "workflow.requested")
     try:
         envelope = json.loads(raw_body)
     except (json.JSONDecodeError, UnicodeDecodeError):
-        return _reject_request(api_key, request_id, name, input_hash, 422, {"error": "invalid_request"})
-    if not isinstance(envelope, dict) or not isinstance(envelope.get("input"), dict):
-        return _reject_request(api_key, request_id, name, input_hash, 422, {"error": "invalid_request"})
+        input_data = None
+    else:
+        input_data = envelope.get("input") if isinstance(envelope, dict) else None
+    if not isinstance(input_data, dict):
+        input_data = None
+    status, body = await run_governed_request(
+        api_key, name, input_data, request.headers.get("Idempotency-Key"), request_id, input_hash,
+    )
+    return _response(status, body, request_id)
 
-    input_data = envelope["input"]
+
+async def run_governed_request(
+    api_key, name: str, input_data: dict | None, idempotency_key: str | None,
+    request_id: uuid.UUID, raw_input_hash: str,
+) -> tuple[int, dict]:
+    input_hash = raw_input_hash
+    workflow = WORKFLOWS[name]
+    await _record(api_key, request_id, name, input_hash, "workflow.requested")
+    if not isinstance(input_data, dict):
+        body = {"error": "invalid_request", "request_id": str(request_id)}
+        await _record(api_key, request_id, name, input_hash, "workflow.rejected", 422, detail=body)
+        return 422, body
     if not workflow.executable:
         try:
             workflow.input_model.model_validate(input_data)
         except ValidationError as exc:
-            return _reject_request(
+            return await _reject_request_body(
                 api_key, request_id, name, input_hash, 422,
-                {"error": "invalid_request", **_validation_detail(exc)},
+                {"error": "invalid_request", "request_id": str(request_id), **_validation_detail(exc)},
             )
-        _record_for_actor(api_key, request_id, name, input_hash, "workflow.not_executable", 501,
-                          detail={"reason": "not_executable"})
-        return _response(501, {"error": "workflow_not_executable", "request_id": str(request_id)}, request_id)
+        await _record(api_key, request_id, name, input_hash, "workflow.not_executable", 501,
+                      detail={"reason": "not_executable"})
+        return 501, {"error": "workflow_not_executable", "request_id": str(request_id)}
 
-    idempotency_key = request.headers.get("Idempotency-Key")
-    if not idempotency_key:
-        result = {"detail": "Idempotency-Key header is required"}
-        _record_for_actor(api_key, request_id, name, input_hash, "workflow.rejected", 400,
-                          detail={"error": "missing_idempotency_key"})
-        return _response(400, result, request_id)
     try:
         canonical_body = json.dumps(
             input_data, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
         ).encode("utf-8")
     except (TypeError, ValueError):
-        return _reject_request(api_key, request_id, name, input_hash, 422, {"error": "invalid_request"})
+        return await _reject_request_body(api_key, request_id, name, input_hash, 422, {"error": "invalid_request", "request_id": str(request_id)})
+
+    hold = None
+    if name == "create_order":
+        threshold_text = os.getenv("APPROVAL_THRESHOLD", "1000.00").strip() or "1000.00"
+        try:
+            threshold = Decimal(threshold_text)
+            if not threshold.is_finite() or threshold < 0:
+                raise InvalidOperation
+        except (InvalidOperation, ValueError):
+            logger.error("Invalid APPROVAL_THRESHOLD request_id=%s", request_id)
+            await _record(api_key, request_id, name, input_hash, "workflow.failed", 503,
+                          detail={"error": "approval_threshold_invalid"})
+            return 503, {"error": "approval_threshold_invalid", "request_id": str(request_id)}
+        hold = HoldPolicy(threshold, request_id, api_key.key_id, api_key.name)
+
+    if name == "adjust_stock":
+        from app.adapters import get_adapter
+        from app.adapters.factory import AdapterConfigurationError
+
+        try:
+            validated = workflow.input_model.model_validate(input_data)
+        except ValidationError as exc:
+            return await _reject_request_body(
+                api_key, request_id, name, input_hash, 422,
+                {"error": "invalid_request", "request_id": str(request_id), **_validation_detail(exc)},
+            )
+        try:
+            active_adapter = get_adapter()
+        except AdapterConfigurationError:
+            logger.error("Stock adjustment adapter is not configured request_id=%s", request_id)
+            await _record(api_key, request_id, name, input_hash, "workflow.failed", 503,
+                          detail={"error": "adapter_not_configured"})
+            return 503, {"error": "adapter_not_configured", "request_id": str(request_id)}
+        if not callable(getattr(active_adapter, "adjust_stock", None)):
+            await _record(api_key, request_id, name, input_hash, "workflow.not_executable", 501,
+                          detail={"reason": "adapter_not_supported"})
+            return 501, {"error": "adapter_not_supported", "request_id": str(request_id)}
+        from app.governance.approvals import create_adjustment_approval
+
+        try:
+            approval_id = await run_in_threadpool(
+                create_adjustment_approval, request_id, validated.model_dump(mode="json"), api_key.key_id, api_key.name,
+            )
+        except Exception as exc:
+            logger.exception("Could not create adjustment approval request_id=%s", request_id)
+            await _record(api_key, request_id, name, input_hash, "workflow.failed", 500,
+                          detail={"error": type(exc).__name__})
+            return 500, {"error": "internal_error", "request_id": str(request_id)}
+        await _record(api_key, request_id, name, input_hash, "workflow.approval_requested", 202,
+                      detail={"approval_id": str(approval_id)})
+        body = {"request_id": str(request_id), "workflow": name,
+                "approval_id": str(approval_id), "status": "PENDING_APPROVAL"}
+        return 202, body
+
+    if not idempotency_key:
+        result = {"detail": "Idempotency-Key header is required", "request_id": str(request_id)}
+        await _record(api_key, request_id, name, input_hash, "workflow.rejected", 400,
+                      detail={"error": "missing_idempotency_key"})
+        return 400, result
 
     try:
-        status, result = await run_in_threadpool(submit_order, canonical_body, idempotency_key)
+        status, result = await run_in_threadpool(submit_order, canonical_body, idempotency_key, hold=hold)
     except Exception as exc:
         logger.exception("Governed workflow failed request_id=%s workflow=%s", request_id, name)
-        _record_for_actor(api_key, request_id, name, input_hash, "workflow.failed", 500,
-                          detail={"error": "internal_error", "exception": type(exc).__name__})
-        return _response(500, {"error": "internal_error", "request_id": str(request_id)}, request_id)
+        await _record(api_key, request_id, name, input_hash, "workflow.failed", 500,
+                      detail={"error": "internal_error", "exception": type(exc).__name__})
+        return 500, {"error": "internal_error", "request_id": str(request_id)}
 
     order_id = _order_id_from_result(result)
+    if status == 202:
+        await _record(api_key, request_id, name, input_hash, "workflow.approval_requested", 202,
+                      order_id=order_id,
+                      detail={"approval_id": result.get("approval_id"), "total": result.get("total"),
+                              "threshold": str(hold.threshold) if hold else None})
+        body = {"request_id": str(request_id), "workflow": name,
+                "approval_id": result.get("approval_id"), "status": "PENDING_APPROVAL", "result": result}
+        return 202, body
     if 200 <= status < 300:
-        _record_for_actor(api_key, request_id, name, input_hash, "workflow.executed", status,
-                          order_id=order_id, detail={"status": status})
+        await _record(api_key, request_id, name, input_hash, "workflow.executed", status,
+                      order_id=order_id, detail={"status": status})
     elif 400 <= status < 500:
         error_detail = result.get("detail") or result.get("reasons") or "rejected"
-        _record_for_actor(api_key, request_id, name, input_hash, "workflow.rejected", status,
-                          order_id=order_id, detail={"error": error_detail})
+        await _record(api_key, request_id, name, input_hash, "workflow.rejected", status,
+                      order_id=order_id, detail={"error": error_detail})
     else:
-        _record_for_actor(api_key, request_id, name, input_hash, "workflow.failed", status,
-                          order_id=order_id, detail={"error": "internal_error"})
-        return _response(500, {"error": "internal_error", "request_id": str(request_id)}, request_id)
-    return _response(status, {"request_id": str(request_id), "workflow": name, "result": result}, request_id)
+        await _record(api_key, request_id, name, input_hash, "workflow.failed", status,
+                      order_id=order_id, detail={"error": "internal_error"})
+        return 500, {"error": "internal_error", "request_id": str(request_id)}
+    return status, {"request_id": str(request_id), "workflow": name, "result": result}
 
 
 def _order_id_from_result(result: dict) -> uuid.UUID | None:
@@ -158,7 +250,7 @@ def _order_id_from_result(result: dict) -> uuid.UUID | None:
         return None
 
 
-def _reject_request(api_key, request_id: uuid.UUID, name: str, input_hash: str,
-                    status: int, body: dict) -> JSONResponse:
-    _record_for_actor(api_key, request_id, name, input_hash, "workflow.rejected", status, detail=body)
-    return _response(status, body, request_id)
+async def _reject_request_body(api_key, request_id: uuid.UUID, name: str, input_hash: str,
+                               status: int, body: dict) -> tuple[int, dict]:
+    await _record(api_key, request_id, name, input_hash, "workflow.rejected", status, detail=body)
+    return status, body

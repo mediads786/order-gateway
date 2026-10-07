@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, Numeric, String, Text, Uuid, func
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, Numeric, String, Text, Uuid, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -118,3 +118,55 @@ class WorkflowEvent(Base):
     order_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("orders.order_id"), nullable=True)
     input_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
     detail: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+
+class Approval(Base):
+    __tablename__ = "approvals"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('PENDING', 'APPROVED', 'REJECTED', 'EXECUTED', 'EXECUTION_FAILED')",
+            name="ck_approvals_status",
+        ),
+        CheckConstraint(
+            "decided_by_key_id IS NULL OR decided_by_key_id <> requested_by_key_id",
+            name="ck_approvals_no_self_decision",
+        ),
+    )
+
+    approval_id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    request_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
+    workflow: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    order_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("orders.order_id"), nullable=True, unique=True)
+    input: Mapped[dict | None] = mapped_column("input", JSONB, nullable=True)
+    requested_by_key_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("api_keys.key_id"), nullable=False)
+    requested_by_name: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    decided_by_key_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("api_keys.key_id"), nullable=True)
+    decided_by_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    decision_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+
+class Proposal(Base):
+    __tablename__ = "proposals"
+    __table_args__ = (
+        CheckConstraint("status IN ('PROPOSED', 'INVALID', 'CONFIRMED', 'DISCARDED')", name="ck_proposals_status"),
+        Index("ix_proposals_requested_by_created_at", "requested_by_key_id", "created_at"),
+    )
+
+    proposal_id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    requested_by_key_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("api_keys.key_id"), nullable=False)
+    requested_by_name: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    text_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    proposer: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    workflow: Mapped[str | None] = mapped_column(Text, nullable=True)
+    input: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    explanation: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    invalid_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)

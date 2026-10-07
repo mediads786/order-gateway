@@ -33,3 +33,16 @@ class MockErpAdapter:
 
     def adjust_stock_for_shipment(self, shipment_id: str, lines: list[ShipmentLine]) -> str:
         raise NotImplementedError("Mock ERP does not support shipments")
+
+    def adjust_stock(self, reference: str, sku: str, qty_delta: int, reason: str) -> dict:
+        response = self.client.post(
+            f"{self.base_url}/stock-adjustments",
+            json={"reference": reference, "sku": sku, "qty_delta": qty_delta, "reason": reason},
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        result = response.json()
+        if (not isinstance(result, dict) or not isinstance(result.get("adjustment_id"), str)
+                or type(result.get("applied")) is not bool):
+            raise ValueError("Mock ERP response did not include a valid stock adjustment result")
+        return result

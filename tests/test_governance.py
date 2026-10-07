@@ -11,7 +11,7 @@ from sqlalchemy.exc import DBAPIError
 from fastapi.testclient import TestClient
 
 from app.admin.auth import session_cookie_value
-from app.db.models import ApiKey, Job, Order, Shipment, WorkflowEvent
+from app.db.models import ApiKey, Approval, Job, Order, Shipment, WorkflowEvent
 from app.db.session import SessionLocal
 from app.governance.keys import hash_api_key
 from app.workers.worker import process_one
@@ -92,6 +92,8 @@ def test_permission_matrix(client, role, workflow):
         assert httpx.get("http://127.0.0.1:9001/sales-orders", timeout=3).json() == []
     elif workflow == "create_order":
         assert response.status_code == 201
+    elif workflow == "adjust_stock":
+        assert response.status_code == 202
     else:
         assert response.status_code == 501
 
@@ -160,7 +162,9 @@ def test_missing_idempotency_key_is_rejected_and_audited(client):
     key = create_key("operator")
     response = workflow_request(client, key, "create_order", OPERATOR_INPUT)
     assert response.status_code == 400
-    assert response.json() == {"detail": "Idempotency-Key header is required"}
+    assert response.json()["detail"] == "Idempotency-Key header is required"
+    request_id = uuid.UUID(response.json()["request_id"])
+    assert str(request_id) == response.headers["X-Request-Id"]
     assert table_count(Order) == 0
     events = events_for_request(response.headers["X-Request-Id"])
     assert [event.event_type for event in events] == ["workflow.requested", "workflow.rejected"]
@@ -190,14 +194,34 @@ def test_invalid_create_order_input_is_rejected_by_intake(client, field, value):
 
 @pytest.mark.parametrize("role", ["operator", "admin"])
 @pytest.mark.parametrize("workflow", ["adjust_stock", "cancel_order"])
-def test_registered_non_executable_workflows_do_not_change_domain_rows(client, role, workflow):
+def test_registered_non_executable_workflows_do_not_change_domain_rows(client, role, workflow, monkeypatch):
     key = create_key(role)
     input_data = (
         {"order_id": None, "sku": "BOOK", "qty_delta": 1, "reason": "cycle count"}
         if workflow == "adjust_stock" else {"order_id": str(uuid.uuid4()), "reason": "duplicate"}
     )
     before = (table_count(Order), table_count(Job), table_count(Shipment))
+    adapter_calls = []
+    if workflow == "adjust_stock":
+        import app.adapters
+
+        class NoCallAdapter:
+            def adjust_stock(self, *args):
+                adapter_calls.append(args)
+
+        monkeypatch.setattr(app.adapters, "get_adapter", lambda: NoCallAdapter())
     response = workflow_request(client, key, workflow, input_data)
+    if workflow == "adjust_stock":
+        assert response.status_code == 202
+        assert response.json()["status"] == "PENDING_APPROVAL"
+        with SessionLocal() as db:
+            approval = db.get(Approval, uuid.UUID(response.json()["approval_id"]))
+            assert approval.status == "PENDING"
+        assert adapter_calls == []
+        events = events_for_request(response.json()["request_id"])
+        assert [event.event_type for event in events] == ["workflow.requested", "workflow.approval_requested"]
+        assert (table_count(Order), table_count(Job), table_count(Shipment)) == before
+        return
     assert response.status_code == 501
     assert response.json()["error"] == "workflow_not_executable"
     events = events_for_request(response.json()["request_id"])
@@ -213,7 +237,13 @@ def test_registry_lists_three_schemas_and_accepts_approver(client):
     assert {item["name"] for item in workflows.json()} == {"create_order", "adjust_stock", "cancel_order"}
     mapping = {item["name"]: item for item in workflows.json()}
     assert mapping["create_order"]["risk"] == "low" and mapping["create_order"]["executable"] is True
-    assert mapping["adjust_stock"]["risk"] == "high" and mapping["adjust_stock"]["executable"] is False
+    assert mapping["adjust_stock"]["risk"] == "high" and mapping["adjust_stock"]["executable"] is True
+    assert mapping["adjust_stock"]["approval"] == "always"
+    assert mapping["adjust_stock"]["decision_roles"] == ["approver", "admin"]
+    assert mapping["create_order"]["approval"] == "conditional"
+    assert mapping["create_order"]["decision_roles"] == ["approver", "admin"]
+    assert mapping["cancel_order"]["approval"] == "always"
+    assert mapping["cancel_order"]["decision_roles"] == ["approver", "admin"]
     assert mapping["cancel_order"]["risk"] == "medium" and mapping["cancel_order"]["executable"] is False
     assert mapping["create_order"]["input_schema"]["properties"]["currency"]
     assert "api_key" not in json.dumps(workflows.json()).lower()

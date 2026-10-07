@@ -87,7 +87,7 @@ def clear_database(migrate_test_database, mock_erp_service):
     reset_response = httpx.post(f"{ERP_TEST_URL}/admin/reset", timeout=3)
     reset_response.raise_for_status()
     with SessionLocal.begin() as db:
-        db.execute(text("TRUNCATE audit_events, shipments, idempotency_keys, jobs, order_lines, orders RESTART IDENTITY CASCADE"))
+        db.execute(text("TRUNCATE workflow_events, proposals, approvals, api_keys, audit_events, shipments, idempotency_keys, jobs, order_lines, orders RESTART IDENTITY CASCADE"))
 
 
 @pytest.fixture

@@ -8,8 +8,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from sqlalchemy import func, select
 
 from app.admin.auth import COOKIE_NAME, authenticated, configured_token, session_cookie_value
-from app.admin.views import ORDER_STATES, PAGE_SIZE, login_page, order_detail_page, orders_page, workflow_events_page
-from app.db.models import AuditEvent, Job, Order, Shipment, WorkflowEvent
+from app.admin.views import ORDER_STATES, PAGE_SIZE, approvals_page, login_page, order_detail_page, orders_page, proposals_page, workflow_events_page
+from app.db.models import Approval, AuditEvent, Job, Order, Proposal, Shipment, WorkflowEvent
 from app.db.session import SessionLocal
 from app.services.retry import requeue_failed_order
 
@@ -145,6 +145,9 @@ def list_workflow_events(request: Request, type: str = "", page: str = "1", refr
     event_types = {
         "workflow.requested", "workflow.denied", "workflow.rejected",
         "workflow.executed", "workflow.not_executable", "workflow.failed",
+        "workflow.approval_requested", "workflow.approved", "workflow.approval_rejected",
+        "workflow.proposed", "workflow.proposal_invalid", "workflow.proposal_confirmed",
+        "workflow.proposal_discarded",
     }
     event_filter = type if type in event_types else ""
     try:
@@ -163,3 +166,72 @@ def list_workflow_events(request: Request, type: str = "", page: str = "1", refr
             .offset((page_number - 1) * PAGE_SIZE).limit(PAGE_SIZE)
         ).all()
     return HTMLResponse(workflow_events_page(rows, event_filter, page_number, total, _refresh_value(refresh)))
+
+
+@router.get("/admin/approvals", response_class=HTMLResponse, include_in_schema=False)
+def list_approvals(request: Request, status: str = "", page: str = "1", refresh: str | None = None):
+    denied = _authorized(request)
+    if denied:
+        return denied
+    approval_states = {"PENDING", "APPROVED", "REJECTED", "EXECUTED", "EXECUTION_FAILED"}
+    status_filter = status if status in approval_states else ""
+    try:
+        page_number = max(1, int(page))
+    except (TypeError, ValueError):
+        page_number = 1
+    with SessionLocal() as db:
+        query = select(Approval)
+        if status_filter:
+            query = query.where(Approval.status == status_filter)
+            total = db.scalar(
+                select(func.count()).select_from(Approval).where(Approval.status == status_filter)
+            ) or 0
+        else:
+            total = db.scalar(select(func.count()).select_from(Approval)) or 0
+        rows = db.scalars(
+            query.order_by(Approval.created_at.desc(), Approval.approval_id.desc())
+            .offset((page_number - 1) * PAGE_SIZE).limit(PAGE_SIZE)
+        ).all()
+        rendered = []
+        for approval in rows:
+            if approval.workflow == "create_order" and approval.order_id:
+                order = db.get(Order, approval.order_id)
+                summary = {"total": str(order.total), "currency": order.currency} if order else {}
+            else:
+                values = approval.input or {}
+                summary = {"sku": values.get("sku"), "qty_delta": values.get("qty_delta")}
+            rendered.append((approval, summary))
+        html = approvals_page(rendered, status_filter, page_number, total, _refresh_value(refresh))
+    return HTMLResponse(html)
+
+
+@router.get("/admin/proposals", response_class=HTMLResponse, include_in_schema=False)
+def list_proposals(request: Request, status: str = "", page: str = "1", refresh: str | None = None):
+    denied = _authorized(request)
+    if denied:
+        return denied
+    proposal_states = {"PROPOSED", "INVALID", "CONFIRMED", "DISCARDED"}
+    status_filter = status if status in proposal_states else ""
+    try:
+        page_number = max(1, int(page))
+    except (TypeError, ValueError):
+        page_number = 1
+    with SessionLocal() as db:
+        query = select(Proposal)
+        if status_filter:
+            query = query.where(Proposal.status == status_filter)
+            total = db.scalar(
+                select(func.count()).select_from(Proposal).where(Proposal.status == status_filter)
+            ) or 0
+        else:
+            total = db.scalar(select(func.count()).select_from(Proposal)) or 0
+        rows = db.scalars(
+            query.order_by(Proposal.created_at.desc(), Proposal.proposal_id.desc())
+            .offset((page_number - 1) * PAGE_SIZE).limit(PAGE_SIZE)
+        ).all()
+        rendered = []
+        for proposal in rows:
+            order_id = (proposal.result or {}).get("order_id")
+            rendered.append((proposal, order_id))
+        html = proposals_page(rendered, status_filter, page_number, total, _refresh_value(refresh))
+    return HTMLResponse(html)

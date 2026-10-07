@@ -4,9 +4,12 @@ from datetime import datetime, timezone
 from html import escape
 from urllib.parse import urlencode
 
-from app.db.models import AuditEvent, Job, Order, Shipment
+from app.db.models import Approval, AuditEvent, Job, Order, Proposal, Shipment
 
-ORDER_STATES = ("RECEIVED", "REJECTED", "QUEUED", "PROCESSING", "RETRYING", "CONFIRMED", "FAILED_DEAD")
+ORDER_STATES = (
+    "RECEIVED", "REJECTED", "PENDING_APPROVAL", "APPROVED", "CANCELLED",
+    "QUEUED", "PROCESSING", "RETRYING", "CONFIRMED", "FAILED_DEAD",
+)
 PAGE_SIZE = 25
 
 
@@ -20,17 +23,19 @@ def utc_text(value: datetime) -> str:
     return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def page(title: str, content: str, *, refresh: bool = True, paused: bool = False) -> str:
+def page(title: str, content: str, *, refresh: bool = True, paused: bool = False, show_logout: bool = True) -> str:
     refresh_tag = '<meta http-equiv="refresh" content="3">' if refresh else ""
     refresh_label = "Resume refresh" if paused else "Pause refresh"
     refresh_value = "1" if paused else "0"
-    style = "body{font:16px system-ui,sans-serif;max-width:1200px;margin:2rem auto;padding:0 1rem}nav{display:flex;gap:1rem;align-items:center;margin-bottom:1.5rem}table{border-collapse:collapse;width:100%;margin:1rem 0}th,td{border:1px solid #bbb;padding:.45rem;text-align:left;vertical-align:top}th{background:#eee}.badge{font-weight:bold}.CONFIRMED{color:#147d32}.FAILED_DEAD{color:#b42318}.RETRYING{color:#9a6700}.PROCESSING{color:#175cd3}.QUEUED{color:#6941c6}.REJECTED{color:#b54708}.RECEIVED{color:#475467}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f5f5f5;padding:.75rem}section{margin:1.5rem 0}"
+    logout = '<form method="post" action="/admin/logout"><button>Logout</button></form>' if show_logout else ""
+    style = "body{font:16px system-ui,sans-serif;max-width:1200px;margin:2rem auto;padding:0 1rem}nav{display:flex;gap:1rem;align-items:center;margin-bottom:1.5rem}table{border-collapse:collapse;width:100%;margin:1rem 0}th,td{border:1px solid #bbb;padding:.45rem;text-align:left;vertical-align:top}th{background:#eee}.badge{font-weight:bold}.CONFIRMED{color:#147d32}.FAILED_DEAD{color:#b42318}.RETRYING{color:#9a6700}.PROCESSING{color:#175cd3}.QUEUED{color:#6941c6}.REJECTED{color:#b54708}.RECEIVED{color:#475467}.PENDING_APPROVAL{color:#9a6700}.APPROVED{color:#147d32}.CANCELLED{color:#b42318}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f5f5f5;padding:.75rem}section{margin:1.5rem 0}"
     return (
         "<!doctype html><html><head><meta charset=\"utf-8\">"
         f"<title>{safe(title)}</title>{refresh_tag}<style>{style}</style></head><body>"
-        "<nav><a href=\"/admin/orders\">Orders</a><a href=\"/admin/workflow-events\">Workflow events</a>"
-        f"<a href=\"?refresh={refresh_value}\">{refresh_label}</a>"
-        "<form method=\"post\" action=\"/admin/logout\"><button>Logout</button></form></nav>"
+        "<nav><a href=\"/admin/orders\">Orders</a><a href=\"/admin/approvals\">Approvals</a>"
+        "<a href=\"/admin/proposals\">Proposals</a>"
+        "<a href=\"/admin/workflow-events\">Workflow events</a>"
+        f"<a href=\"?refresh={refresh_value}\">{refresh_label}</a>{logout}</nav>"
         f"{content}</body></html>"
     )
 
@@ -99,6 +104,10 @@ def order_detail_page(
 ) -> str:
     flash = {"requeued": "Order requeued.", "not_dead": "Order is not failed dead.", "not_found": "Order not found."}
     notice = f"<p>{safe(flash[message])}</p>" if message in flash else ""
+    if order.status == "PENDING_APPROVAL":
+        notice += "<p>Waiting for approval</p>"
+    elif order.status == "CANCELLED":
+        notice += "<p>Cancelled</p>"
     customer = f"{order.customer_name or ''} {order.customer_email or ''} {order.customer_phone or ''}"
     header = (
         "<section><h2>Order</h2><dl>"
@@ -179,6 +188,9 @@ def workflow_events_page(
     event_types = (
         "workflow.requested", "workflow.denied", "workflow.rejected",
         "workflow.executed", "workflow.not_executable", "workflow.failed",
+        "workflow.approval_requested", "workflow.approved", "workflow.approval_rejected",
+        "workflow.proposed", "workflow.proposal_invalid", "workflow.proposal_confirmed",
+        "workflow.proposal_discarded",
     )
     filters = ['<a href="/admin/workflow-events">ALL</a>']
     filters.extend(
@@ -206,3 +218,79 @@ def workflow_events_page(
         + f"<p>{previous}Page {page_number}{' ' + next_link if next_link else ''}</p>"
     )
     return page("Workflow events", body, refresh=refresh, paused=not refresh)
+
+
+def approvals_page(rows: list[tuple[Approval, dict]], status: str, page_number: int, total: int, refresh: bool) -> str:
+    table_rows = []
+    for approval, summary in rows:
+        order_link = ""
+        if approval.order_id is not None:
+            order_id = str(approval.order_id)
+            order_link = f'<a href="/admin/orders/{safe(order_id)}">{safe(order_id[:8])}</a>'
+        table_rows.append(
+            "<tr>"
+            f"<td>{safe(utc_text(approval.created_at))}</td>"
+            f"<td>{safe(str(approval.approval_id)[:8])}</td><td>{safe(approval.workflow)}</td>"
+            f"<td>{safe(approval.status)}</td><td>{safe(approval.requested_by_name)}</td>"
+            f"<td>{safe(approval.decided_by_name)}</td><td>{safe(utc_text(approval.decided_at) if approval.decided_at else '')}</td>"
+            f"<td>{safe(approval.decision_reason)}</td><td>{order_link}</td>"
+            f"<td>{safe(json.dumps(summary, sort_keys=True, ensure_ascii=False))}</td></tr>"
+        )
+    if not table_rows:
+        table_rows.append('<tr><td colspan="10">No approvals found.</td></tr>')
+    statuses = ("PENDING", "APPROVED", "REJECTED", "EXECUTED", "EXECUTION_FAILED")
+    filters = ['<a href="/admin/approvals">ALL</a>']
+    filters.extend(f'<a href="/admin/approvals?{urlencode({"status": item})}">{item}</a>' for item in statuses)
+    params = {"status": status} if status else {}
+    previous = ""
+    if page_number > 1:
+        previous = f'<a href="/admin/approvals?{urlencode({**params, "page": page_number - 1})}">Prev</a> '
+    next_link = ""
+    if page_number * PAGE_SIZE < total:
+        next_link = f'<a href="/admin/approvals?{urlencode({**params, "page": page_number + 1})}">Next</a>'
+    body = (
+        "<h1>Approvals</h1><p>" + " | ".join(filters) + "</p>"
+        + f"<p>Filter: {safe(status or 'ALL')}</p>"
+        + "<table><thead><tr><th>Created (UTC)</th><th>Approval</th><th>Workflow</th><th>Status</th>"
+        "<th>Requested by</th><th>Decided by</th><th>Decided at</th><th>Reason</th><th>Order</th><th>Summary</th>"
+        "</tr></thead><tbody>" + "".join(table_rows) + "</tbody></table>"
+        + f"<p>{previous}Page {page_number}{' ' + next_link if next_link else ''}</p>"
+    )
+    return page("Approvals", body, refresh=refresh, paused=not refresh, show_logout=False)
+
+
+def proposals_page(rows: list[tuple[Proposal, str | None]], status: str, page_number: int, total: int, refresh: bool) -> str:
+    table_rows = []
+    for proposal, order_id in rows:
+        order_link = ""
+        if order_id:
+            order_link = f'<a href="/admin/orders/{safe(order_id)}">{safe(order_id[:8])}</a>'
+        table_rows.append(
+            "<tr>"
+            f"<td>{safe(utc_text(proposal.created_at))}</td>"
+            f"<td>{safe(str(proposal.proposal_id)[:8])}</td>"
+            f"<td>{safe(proposal.requested_by_name)}</td><td>{safe(proposal.proposer)}</td>"
+            f"<td>{safe(proposal.status)}</td><td>{safe(proposal.workflow)}</td>"
+            f"<td>{safe(proposal.invalid_reason)}</td><td>{len(proposal.text)}</td><td>{order_link}</td></tr>"
+        )
+    if not table_rows:
+        table_rows.append('<tr><td colspan="9">No proposals found.</td></tr>')
+    statuses = ("PROPOSED", "INVALID", "CONFIRMED", "DISCARDED")
+    filters = ['<a href="/admin/proposals">ALL</a>']
+    filters.extend(f'<a href="/admin/proposals?{urlencode({"status": item})}">{item}</a>' for item in statuses)
+    params = {"status": status} if status else {}
+    previous = ""
+    if page_number > 1:
+        previous = f'<a href="/admin/proposals?{urlencode({**params, "page": page_number - 1})}">Prev</a> '
+    next_link = ""
+    if page_number * PAGE_SIZE < total:
+        next_link = f'<a href="/admin/proposals?{urlencode({**params, "page": page_number + 1})}">Next</a>'
+    body = (
+        "<h1>Proposals</h1><p>" + " | ".join(filters) + "</p>"
+        + f"<p>Filter: {safe(status or 'ALL')}</p>"
+        + "<table><thead><tr><th>Created (UTC)</th><th>Proposal</th><th>Requested by</th>"
+        "<th>Proposer</th><th>Status</th><th>Workflow</th><th>Invalid reason</th><th>Text length</th><th>Order</th>"
+        "</tr></thead><tbody>" + "".join(table_rows) + "</tbody></table>"
+        + f"<p>{previous}Page {page_number}{' ' + next_link if next_link else ''}</p>"
+    )
+    return page("Proposals", body, refresh=refresh, paused=not refresh, show_logout=False)
