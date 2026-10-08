@@ -7,6 +7,8 @@ from sqlalchemy import func, select, text, update
 from app.db.models import Proposal, WorkflowEvent
 from app.db.session import SessionLocal
 
+WORKFLOW_NAME_MAX_LENGTH = 100
+
 
 def text_digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
@@ -23,21 +25,25 @@ def _add_event(
     db, *, request_id: uuid.UUID, api_key, event_type: str, workflow: str | None,
     text_hash: str, proposal_id: uuid.UUID, status: int | None = None, detail: dict | None = None,
 ) -> None:
+    event_workflow = workflow[:WORKFLOW_NAME_MAX_LENGTH] if workflow is not None else None
     db.add(WorkflowEvent(
         request_id=request_id,
         key_id=api_key.key_id,
         actor_name=api_key.name,
         role=api_key.role,
-        workflow=workflow,
+        workflow=event_workflow,
         event_type=event_type,
         http_status=status,
         input_hash=text_hash,
         detail={
             "proposal_id": str(proposal_id),
             "proposer": detail["proposer"],
-            "workflow": workflow,
+            "workflow": event_workflow,
             "text_hash": text_hash,
-            **{key: value for key, value in (detail or {}).items() if key != "proposer"},
+            **{
+                key: value for key, value in (detail or {}).items()
+                if key not in {"proposer", "workflow"}
+            },
         },
         created_at=datetime.now(timezone.utc),
     ))
@@ -102,7 +108,8 @@ def proposal_body(proposal: Proposal) -> dict:
     return {
         "proposal_id": str(proposal.proposal_id),
         "status": proposal.status,
-        "workflow": proposal.workflow,
+        "workflow": proposal.workflow[:WORKFLOW_NAME_MAX_LENGTH]
+        if proposal.workflow is not None else None,
         "input": proposal.input,
         "explanation": proposal.explanation,
         "invalid_reason": proposal.invalid_reason,

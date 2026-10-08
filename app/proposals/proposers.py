@@ -53,7 +53,7 @@ class RuleProposer:
 
         order = re.fullmatch(
             r"\s*order\s+(\d+)\s+([A-Za-z0-9._-]+)\s+at\s+(\d+(?:\.\d+)?)\s+"
-            r"for\s+(.+?),\s*phone\s+([+()\d\s-]+)\s*",
+            r"for\s+(.+?),\s*phone\s+(\d+)\s*",
             text,
             flags=re.IGNORECASE,
         )

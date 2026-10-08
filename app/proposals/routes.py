@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import math
@@ -23,6 +24,7 @@ from app.proposals.proposers import (
     get_proposer,
 )
 from app.proposals.service import (
+    WORKFLOW_NAME_MAX_LENGTH,
     count_today,
     proposal_body,
     proposal_event,
@@ -149,10 +151,15 @@ async def create_proposal(request: Request):
         if result.explanation is not None and not isinstance(result.explanation, str):
             raise TypeError("proposer explanation has an invalid type")
         explanation = result.explanation[:300] if result.explanation is not None else None
-        workflow_name = result.workflow
+        workflow_name = (
+            result.workflow[:WORKFLOW_NAME_MAX_LENGTH]
+            if isinstance(result.workflow, str) else None
+        )
         if result.workflow is None:
             invalid_reason = "no_matching_workflow"
-        elif result.workflow not in {item.name for item in _allowed_workflows(api_key.role)}:
+        elif not isinstance(result.workflow, str) or result.workflow not in {
+            item.name for item in _allowed_workflows(api_key.role)
+        }:
             invalid_reason = "workflow_not_allowed"
         else:
             workflow = WORKFLOWS[result.workflow]
@@ -242,8 +249,8 @@ def _confirm_result(status: int, body: dict, request_id: uuid.UUID) -> dict:
 
 
 @router.post("/proposals/{proposal_id}/confirm")
-async def confirm_proposal(request: Request, proposal_id: str):
-    api_key = await run_in_threadpool(authenticate_api_key, request.headers.get("X-API-Key"))
+def confirm_proposal(request: Request, proposal_id: str):
+    api_key = authenticate_api_key(request.headers.get("X-API-Key"))
     if api_key is None:
         return JSONResponse(status_code=401, content={"error": "unauthorized"})
     try:
@@ -258,31 +265,33 @@ async def confirm_proposal(request: Request, proposal_id: str):
         )
         if proposal is None or proposal.requested_by_key_id != api_key.key_id:
             return JSONResponse(status_code=404, content={"error": "not_found"})
+        if proposal.status != "PROPOSED":
+            return _response(409, {
+                "error": "already_decided", "status": proposal.status, "request_id": str(request_id),
+            }, request_id)
         if not can_request(api_key.role, proposal.workflow or ""):
             db.add(WorkflowEvent(
                 request_id=request_id, key_id=api_key.key_id, actor_name=api_key.name,
-                role=api_key.role, workflow=proposal.workflow, event_type="workflow.denied",
+                role=api_key.role,
+                workflow=proposal.workflow[:WORKFLOW_NAME_MAX_LENGTH]
+                if proposal.workflow is not None else None,
+                event_type="workflow.denied",
                 http_status=403, input_hash=proposal.text_hash,
                 detail={"reason": "forbidden", "proposal_id": str(parsed_id),
                         "proposer": proposal.proposer, "text_hash": proposal.text_hash},
                 created_at=datetime.now(timezone.utc),
             ))
             return _response(403, {"error": "forbidden", "request_id": str(request_id)}, request_id)
-        if proposal.status != "PROPOSED":
-            return _response(409, {
-                "error": "already_decided", "status": proposal.status, "request_id": str(request_id),
-            }, request_id)
-
         from app.governance.routes import run_governed_request
 
-        status, body = await run_governed_request(
+        status, body = asyncio.run(run_governed_request(
             api_key,
             proposal.workflow,
             proposal.input,
             f"PROP:{parsed_id}",
             request_id,
             proposal.text_hash,
-        )
+        ))
         outcome = _confirm_result(status, body, request_id)
         if not transition_proposal(db, parsed_id, "CONFIRMED", datetime.now(timezone.utc), outcome):
             return _response(409, {
@@ -290,11 +299,16 @@ async def confirm_proposal(request: Request, proposal_id: str):
             }, request_id)
         db.add(WorkflowEvent(
             request_id=request_id, key_id=api_key.key_id, actor_name=api_key.name,
-            role=api_key.role, workflow=proposal.workflow, event_type="workflow.proposal_confirmed",
+            role=api_key.role,
+            workflow=proposal.workflow[:WORKFLOW_NAME_MAX_LENGTH]
+            if proposal.workflow is not None else None,
+            event_type="workflow.proposal_confirmed",
             http_status=status, input_hash=proposal.text_hash,
             detail={
                 "proposal_id": str(parsed_id), "proposer": proposal.proposer,
-                "workflow": proposal.workflow, "text_hash": proposal.text_hash,
+                "workflow": proposal.workflow[:WORKFLOW_NAME_MAX_LENGTH]
+                if proposal.workflow is not None else None,
+                "text_hash": proposal.text_hash,
                 "status": status, "request_id": str(request_id),
             },
             created_at=datetime.now(timezone.utc),

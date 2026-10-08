@@ -148,6 +148,33 @@ Invoke-RestMethod -Method Post -Uri "http://localhost:8002/approvals/$ApprovalId
 
 New order audit events are `order.pending_approval`, `order.approved`, and `order.cancelled`. Workflow audit events include `workflow.approval_requested`, `workflow.approved`, and `workflow.approval_rejected`; existing `workflow.executed`, `workflow.denied`, and `workflow.failed` events record the result or refusal.
 
+### Natural-language proposals
+
+The proposal safety model is:
+
+1. A proposal is a draft, not a workflow request.
+2. The proposer can select only executable workflows the caller may request.
+3. The selected input is validated by that workflow's schema.
+4. Confirmation uses the normal governed request path with the requester's own key.
+5. Role checks, approval thresholds, and self-approval rules still apply.
+
+The default rule proposer recognizes only these patterns (case-insensitive):
+
+- `add|remove|adjust <int> (of|to|for|from)? <SKU> ... reason: <text>`; the reason is everything after `reason:` and `add`/`remove` determine the sign.
+- `order <qty> <SKU> at <price> for <name>, phone <digits>`; currency comes from `DEFAULT_CURRENCY` when set, otherwise `PKR`.
+
+`POST /proposals` creates a draft. Use `GET /proposals` or `GET /proposals/{id}` to review it, then `POST /proposals/{id}/confirm` or `/discard`. Only the creating key can confirm or discard; approvers and admins can read all proposals. Proposal audit events are `workflow.proposed`, `workflow.proposal_invalid`, `workflow.proposal_confirmed`, and `workflow.proposal_discarded`.
+
+```powershell
+$OperatorKey = Read-Host "Operator API key"
+$Body = '{"text":"order 2 BOOK at 19.99 for Ada, phone 03001234567"}'
+$Proposal = Invoke-RestMethod -Method Post -Uri http://localhost:8002/proposals -Headers @{ "X-API-Key" = $OperatorKey } -ContentType "application/json" -Body $Body
+Invoke-RestMethod -Uri "http://localhost:8002/proposals/$($Proposal.proposal_id)" -Headers @{ "X-API-Key" = $OperatorKey }
+Invoke-RestMethod -Method Post -Uri "http://localhost:8002/proposals/$($Proposal.proposal_id)/confirm" -Headers @{ "X-API-Key" = $OperatorKey }
+```
+
+The proposer only converts text into a schema-checked draft; it has no credentials or execution tools. The normal gateway performs all writes after the person confirms.
+
 Create, list, or deactivate keys from the repository root after migrations have run:
 
 ```powershell
@@ -252,6 +279,13 @@ $env:ODOO_LIVE = "1"
 | `SHIPMENT_WEBHOOK_SECRET` | empty | Shipment HMAC secret | Yes |
 | `ADMIN_TOKEN` | empty | Admin login token; minimum 16 characters | Yes |
 | `APPROVAL_THRESHOLD` | `1000.00` | Governed order total above which approval is required | No |
+| `PROPOSER` | `rule` | `rule` or optional `anthropic` proposer | No |
+| `DEFAULT_CURRENCY` | `PKR` | Currency used by the rule-based order proposal when set | No |
+| `ANTHROPIC_API_KEY` | empty | Anthropic Messages API key when `PROPOSER=anthropic` | Yes |
+| `PROPOSER_MODEL` | `claude-sonnet-5-5` | Anthropic model name | No |
+| `PROPOSER_TIMEOUT_SECONDS` | `20` | One model-call timeout; no retries | No |
+| `PROPOSAL_DAILY_LIMIT` | `50` | Maximum proposals per key per UTC day | No |
+| `PROPOSAL_TEXT_MAX_CHARS` | `1000` | Maximum submitted sentence length | No |
 | `ODOO_BASE_URL` | empty | Odoo JSON-2 base URL | No |
 | `ODOO_DB` | `gateway` | Odoo database header | No |
 | `ODOO_API_KEY` | empty | Odoo bearer API key | Yes |
@@ -285,7 +319,10 @@ $env:ODOO_LIVE = "1"
 - Existing `POST /orders`, Shopify, shipment, and retry endpoints bypass approvals; only governed workflows use the approval rules.
 - The threshold ignores currency, pending approvals do not expire, and decisions are available through the API only.
 - Failed `adjust_stock` approval executions are not retried automatically; a requester must submit a new request.
+- Rule-based natural-language matching supports only the two documented patterns; the optional Anthropic proposer is not tested against the live API here.
+- Confirmed proposals are not retried; submit a new proposal after a governed failure. Proposal text is stored in `proposals` and retention is not managed. Daily proposal limits are per API key, not per IP.
 - Approval state commits and workflow audit events use separate transactions, leaving a small crash window where the state is committed before its corresponding workflow event.
+- Confirm holds a proposal row lock and a database connection while it runs the governed flow, which needs a second connection; with many simultaneous confirms the connection pool (default 5 + 10 overflow) is the limit.
 - Admin uses one shared token, has no per-user identity and no login rate limiting.
 - The API retry endpoint has no authentication in v1.
 - The admin cookie is not marked `Secure` over plain HTTP.
@@ -293,7 +330,7 @@ $env:ODOO_LIVE = "1"
 ## Roadmap
 
 - Layer 2: workflow registry, roles, approvals, and governed stock adjustment are implemented.
-- Layer 3: natural-language proposals that can only propose changes.
+- Layer 3, part 1: natural-language proposals that can only propose changes is implemented.
 
 ## Project layout
 
