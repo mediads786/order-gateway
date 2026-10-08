@@ -223,6 +223,9 @@ def workflow_events_page(
 def approvals_page(rows: list[tuple[Approval, dict]], status: str, page_number: int, total: int, refresh: bool) -> str:
     table_rows = []
     for approval, summary in rows:
+        if approval.workflow == "cancel_order":
+            values = approval.input or {}
+            summary = {"order_id": values.get("order_id"), "reason": values.get("reason")}
         order_link = ""
         if approval.order_id is not None:
             order_id = str(approval.order_id)

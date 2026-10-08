@@ -81,6 +81,10 @@ def test_permission_matrix(client, role, workflow):
         "adjust_stock": {"order_id": None, "sku": "BOOK", "qty_delta": 1, "reason": "cycle count"},
         "cancel_order": {"order_id": str(uuid.uuid4()), "reason": "duplicate"},
     }
+    if workflow == "cancel_order" and role != "approver":
+        order_response = client.post("/orders", json=OPERATOR_INPUT,
+                                     headers={"Idempotency-Key": f"permission-{uuid.uuid4()}"})
+        inputs[workflow] = {"order_id": order_response.json()["order_id"], "reason": "duplicate"}
     response = workflow_request(client, key, workflow, inputs[workflow], "permission-matrix")
     if role == "approver":
         assert response.status_code == 403 and response.json()["error"] == "forbidden"
@@ -94,6 +98,9 @@ def test_permission_matrix(client, role, workflow):
         assert response.status_code == 201
     elif workflow == "adjust_stock":
         assert response.status_code == 202
+    elif workflow == "cancel_order":
+        assert response.status_code == 202
+        assert response.json()["status"] == "PENDING_APPROVAL"
     else:
         assert response.status_code == 501
 
@@ -196,10 +203,15 @@ def test_invalid_create_order_input_is_rejected_by_intake(client, field, value):
 @pytest.mark.parametrize("workflow", ["adjust_stock", "cancel_order"])
 def test_registered_non_executable_workflows_do_not_change_domain_rows(client, role, workflow, monkeypatch):
     key = create_key(role)
-    input_data = (
+    if workflow == "cancel_order":
+        created = client.post("/orders", json=OPERATOR_INPUT,
+                              headers={"Idempotency-Key": f"non-executable-{uuid.uuid4()}"})
+        input_data = {"order_id": created.json()["order_id"], "reason": "duplicate"}
+    else:
+        input_data = (
         {"order_id": None, "sku": "BOOK", "qty_delta": 1, "reason": "cycle count"}
         if workflow == "adjust_stock" else {"order_id": str(uuid.uuid4()), "reason": "duplicate"}
-    )
+        )
     before = (table_count(Order), table_count(Job), table_count(Shipment))
     adapter_calls = []
     if workflow == "adjust_stock":
@@ -222,11 +234,14 @@ def test_registered_non_executable_workflows_do_not_change_domain_rows(client, r
         assert [event.event_type for event in events] == ["workflow.requested", "workflow.approval_requested"]
         assert (table_count(Order), table_count(Job), table_count(Shipment)) == before
         return
-    assert response.status_code == 501
-    assert response.json()["error"] == "workflow_not_executable"
+    assert response.status_code == 202
+    assert response.json()["status"] == "PENDING_APPROVAL"
+    with SessionLocal() as db:
+        approval = db.get(Approval, uuid.UUID(response.json()["approval_id"]))
+        assert approval.status == "PENDING" and approval.order_id is None
+        assert approval.input["order_id"] == input_data["order_id"]
     events = events_for_request(response.json()["request_id"])
-    assert [event.event_type for event in events] == ["workflow.requested", "workflow.not_executable"]
-    assert events[-1].http_status == 501
+    assert [event.event_type for event in events] == ["workflow.requested", "workflow.approval_requested"]
     assert (table_count(Order), table_count(Job), table_count(Shipment)) == before
 
 
@@ -244,7 +259,7 @@ def test_registry_lists_three_schemas_and_accepts_approver(client):
     assert mapping["create_order"]["decision_roles"] == ["approver", "admin"]
     assert mapping["cancel_order"]["approval"] == "always"
     assert mapping["cancel_order"]["decision_roles"] == ["approver", "admin"]
-    assert mapping["cancel_order"]["risk"] == "medium" and mapping["cancel_order"]["executable"] is False
+    assert mapping["cancel_order"]["risk"] == "medium" and mapping["cancel_order"]["executable"] is True
     assert mapping["create_order"]["input_schema"]["properties"]["currency"]
     assert "api_key" not in json.dumps(workflows.json()).lower()
 

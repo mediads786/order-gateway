@@ -12,6 +12,8 @@ class FakeOdoo:
         self.orders: dict[str, dict] = {}
         self.quants: dict[tuple[int, int], dict] = {}
         self.moves: dict[str, dict] = {}
+        self.deliveries: list[dict] = []
+        self.cancel_without_effect = False
         self.calls: list[tuple[str, str, dict]] = []
         self.fail_next: tuple[int, dict] | None = None
         self.timeout_next = False
@@ -72,8 +74,15 @@ class FakeOdoo:
     def _dispatch(self, model: str, method: str, args: dict[str, Any]) -> Any:
         if (model, method) == ("sale.order", "search_read"):
             ref = self._domain_value(args["domain"], "client_order_ref")
-            order = self.orders.get(ref)
+            if ref is None:
+                order_id = self._domain_value(args["domain"], "id")
+                order = next((row for row in self.orders.values() if row["id"] == order_id), None)
+            else:
+                order = self.orders.get(ref)
             return [{"id": order["id"], "state": order["state"]}] if order else []
+        if (model, method) == ("stock.picking", "search_read"):
+            order_id = self._domain_value(args["domain"], "sale_id")
+            return [dict(row) for row in self.deliveries if row.get("sale_id") == order_id]
         if (model, method) == ("product.product", "search_read"):
             sku = self._domain_value(args["domain"], "default_code")
             skus = sku if isinstance(sku, list) else [sku]
@@ -97,6 +106,12 @@ class FakeOdoo:
             for order in self.orders.values():
                 if order["id"] in args["ids"]:
                     order["state"] = "sale"
+            return True
+        if (model, method) == ("sale.order", "action_cancel"):
+            if not self.cancel_without_effect:
+                for order in self.orders.values():
+                    if order["id"] in args["ids"]:
+                        order["state"] = "cancel"
             return True
         if (model, method) == ("stock.warehouse", "search_read"):
             return [{"id": 1, "lot_stock_id": [5, "WH/Stock"]}]

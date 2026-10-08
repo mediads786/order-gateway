@@ -1,6 +1,6 @@
 # Order Gateway
 
-An idempotent order intake and delivery service that stores orders in PostgreSQL, retries ERP delivery, and provides an operations view.
+- An idempotent order intake and delivery service that stores orders in PostgreSQL, retries ERP delivery, and provides an operations view.
 
 ![Demo: ERP failure, retries, recovery](docs/demo.gif)
 
@@ -114,11 +114,13 @@ Then run the tests after Compose is up:
 .\.venv\Scripts\python.exe -m pytest -v
 ```
 
+Test result placeholder: **224 tests passed, 1 skipped** (replace `N` with your observed output).
+
 The test fixture reads `TEST_DATABASE_URL` from the environment or `.env`, creates the named test database if missing, checks that its name ends in `_test`, and sets `DATABASE_URL` to it before importing the app.
 
 ## Demo
 
-Follow the [3-minute operations demo](docs/demo.md), the [about-60-second governance demo](docs/demo.md#governance-demo-about-60-seconds), or the [about-90-second approval demo](docs/demo.md#approval-demo-about-90-seconds).
+Follow the [3-minute operations demo](docs/demo.md), the [about-60-second governance demo](docs/demo.md#governance-demo-about-60-seconds), the [about-90-second approval demo](docs/demo.md#approval-demo-about-90-seconds), or the [about-60-second cancellation demo](docs/demo.md#cancellation-demo-about-60-seconds).
 
 ## Admin pages
 
@@ -130,11 +132,23 @@ The admin has one shared identity, so an admin retry audit event cannot identify
 
 Migration `0006_workflow_governance` adds database-backed API keys and append-only `workflow_events`. API keys are stored as SHA-256 hashes; the raw key is printed only at creation. `operator`, `approver`, and `admin` are the supported roles. Send the key in `X-API-Key`; callers cannot select their own role. `GET /workflows` returns the registered schemas. `POST /workflows/{name}/requests` accepts `{"input": {...}}`, and executable order intake also requires `Idempotency-Key`. Responses include a `request_id` in both the JSON body and `X-Request-Id` header. Unauthorized calls do not create workflow events; authenticated denials and outcomes are audited without storing raw request bodies or API keys.
 
-The registry contains `create_order` (low risk, executable), `adjust_stock` (high risk, executable after approval), and `cancel_order` (medium risk, not executable; it returns `501`). Operators and admins may request these workflows. Only approvers and admins may decide, and a key cannot decide its own request.
+The registry contains `create_order` (low risk), `adjust_stock` (high risk, always approved), and `cancel_order` (medium risk, always approved). Operators and admins may request these workflows. Only approvers and admins may decide, and a key cannot decide its own request.
 
 ### Approvals
 
 Governed `create_order` requests whose computed `Decimal` total is strictly greater than `APPROVAL_THRESHOLD` are stored as `PENDING_APPROVAL` without a job. The default threshold is `1000.00`; equality does not require approval, and currency is ignored by the comparison. A different approver or admin can approve, which queues the order, or reject with a reason, which sets it to `CANCELLED`. Every `adjust_stock` request waits for approval before the adapter is called. A failed stock adjustment is recorded as `EXECUTION_FAILED` and is not retried automatically.
+
+`cancel_order` takes `{"order_id": "<uuid>", "reason": "..."}` and always creates a pending approval; it never calls the ERP at request time. Eligibility is checked when requested and checked again under row locks after approval:
+
+| Condition | Result |
+|---|---|
+| Order not found | `404 order_not_found` |
+| `CANCELLED` or `REJECTED` | `409 order_not_cancellable` |
+| `PENDING_APPROVAL` / `APPROVED` / `PROCESSING` | `409 order_pending_approval` / `order_in_progress` |
+| `CONFIRMED` with ERP ID; or fresh `RECEIVED`/`QUEUED` with a queued job, zero attempts, and no ERP ID | Eligible; ERP or local cancellation respectively |
+| Retrying/dead job with attempts and no ERP ID; all other states | `409 erp_state_unknown` / `order_not_cancellable` |
+
+The gateway refuses cancellation when ERP state is unknown because a timed-out create may already have made an ERP record. Cancellation events are `workflow.requested`, `workflow.approval_requested`, `workflow.approved`, then `order.cancelled` and `workflow.executed` (or `workflow.failed`). Rejection leaves the order untouched. The admin approvals summary shows the target order and reason.
 
 The API endpoints are `GET /approvals?status=PENDING&page=1`, `GET /approvals/{approval_id}`, and `POST /approvals/{approval_id}/decision`. Approvers and admins can see all approvals; operators can see only requests they made. The admin approval page is read-only; decisions require an API key so requester identity and the self-approval rule remain enforceable.
 
@@ -162,6 +176,7 @@ The default rule proposer recognizes only these patterns (case-insensitive):
 
 - `add|remove|adjust <int> (of|to|for|from)? <SKU> ... reason: <text>`; the reason is everything after `reason:` and `add`/`remove` determine the sign.
 - `order <qty> <SKU> at <price> for <name>, phone <digits>`; currency comes from `DEFAULT_CURRENCY` when set, otherwise `PKR`.
+- `cancel order <uuid> reason: <text>`; confirmation creates the same governed cancellation approval as a direct request.
 
 `POST /proposals` creates a draft. Use `GET /proposals` or `GET /proposals/{id}` to review it, then `POST /proposals/{id}/confirm` or `/discard`. Only the creating key can confirm or discard; approvers and admins can read all proposals. Proposal audit events are `workflow.proposed`, `workflow.proposal_invalid`, `workflow.proposal_confirmed`, and `workflow.proposal_discarded`.
 
@@ -321,6 +336,7 @@ $env:ODOO_LIVE = "1"
 - Failed `adjust_stock` approval executions are not retried automatically; a requester must submit a new request.
 - Rule-based natural-language matching supports only the two documented patterns; the optional Anthropic proposer is not tested against the live API here.
 - Confirmed proposals are not retried; submit a new proposal after a governed failure. Proposal text is stored in `proposals` and retention is not managed. Daily proposal limits are per API key, not per IP.
+- Retrying or dead orders without an ERP ID are refused as `erp_state_unknown` and require manual handling. A crash after a successful ERP cancellation but before the gateway update leaves the approval `APPROVED`; the idempotent adapter call can be rerun manually. Odoo cancellation is verified with fixtures only (the cancellation calls are marked UNVERIFIED LIVE in `docs/odoo-notes.md`); partial cancellations are unsupported.
 - Approval state commits and workflow audit events use separate transactions, leaving a small crash window where the state is committed before its corresponding workflow event.
 - Confirm holds a proposal row lock and a database connection while it runs the governed flow, which needs a second connection; with many simultaneous confirms the connection pool (default 5 + 10 overflow) is the limit.
 - Admin uses one shared token, has no per-user identity and no login rate limiting.
@@ -330,6 +346,7 @@ $env:ODOO_LIVE = "1"
 ## Roadmap
 
 - Layer 2: workflow registry, roles, approvals, and governed stock adjustment are implemented.
+- Layer 2: governed order cancellation is implemented.
 - Layer 3, part 1: natural-language proposals that can only propose changes is implemented.
 
 ## Project layout

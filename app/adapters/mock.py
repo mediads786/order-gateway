@@ -46,3 +46,15 @@ class MockErpAdapter:
                 or type(result.get("applied")) is not bool):
             raise ValueError("Mock ERP response did not include a valid stock adjustment result")
         return result
+
+    def cancel_order(self, reference: str, erp_order_id: str, reason: str) -> dict:
+        response = self.client.post(
+            f"{self.base_url}/sales-orders/{erp_order_id}/cancel",
+            json={"reference": reference, "reason": reason}, timeout=self.timeout,
+        )
+        response.raise_for_status()
+        result = response.json()
+        if (not isinstance(result, dict) or not isinstance(result.get("cancel_id"), str)
+                or type(result.get("applied")) is not bool):
+            raise ValueError("Mock ERP response did not include a valid cancellation result")
+        return result

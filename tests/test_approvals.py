@@ -388,9 +388,9 @@ def test_approval_visibility_and_registry_metadata(client, monkeypatch):
     by_name = {item["name"]: item for item in registry}
     assert by_name["create_order"]["approval"] == "conditional"
     assert by_name["adjust_stock"]["approval"] == "always" and by_name["adjust_stock"]["executable"]
-    assert by_name["cancel_order"]["approval"] == "always" and not by_name["cancel_order"]["executable"]
+    assert by_name["cancel_order"]["approval"] == "always" and by_name["cancel_order"]["executable"]
     cancel = workflow_request(client, requester, "cancel_order", {"order_id": str(uuid.uuid4()), "reason": "x"})
-    assert cancel.status_code == 501
+    assert cancel.status_code == 404 and cancel.json()["error"] == "order_not_found"
 
 
 def test_admin_approvals_page_is_read_only_filtered_and_escaped(client, monkeypatch):

@@ -51,3 +51,7 @@ Status codes alone are not reliable; classify by `name` as well (see spec sectio
 ## Not verified yet
 
 `sale.order/create` with `order_line` command lists, and `sale.order` state values, are not probed. Implement from standard Odoo fields (spec section 6) and let the opt-in live smoke test confirm them.
+
+## Cancellation calls — UNVERIFIED LIVE
+
+Module 9 cancellation uses the standard JSON-2 request shape: `sale.order/search_read` with `{"domain": [["id", "=", <id>]], "fields": ["id", "state"], "limit": 1}`, paged `stock.picking/search_read` calls with `{"domain": [["sale_id", "=", <id>]], "fields": ["id", "state"], "limit": 100, "offset": <offset>}`, then `sale.order/action_cancel` with `{"ids": [<id>]}` and a final `sale.order/search_read` state check. These cancellation and delivery lookup calls have not been verified against the live instance. A `done` delivery refuses cancellation as `already_delivered`.

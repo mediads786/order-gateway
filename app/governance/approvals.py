@@ -9,6 +9,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
 
 from app.adapters import get_adapter
@@ -24,6 +25,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 PAGE_SIZE = 25
 APPROVAL_STATES = ("PENDING", "APPROVED", "REJECTED", "EXECUTED", "EXECUTION_FAILED")
+
+
+class LocalCancellationUpdateError(RuntimeError):
+    pass
 
 
 class DecisionInput(BaseModel):
@@ -76,7 +81,62 @@ def _approval_summary(db, approval: Approval) -> dict:
         order = db.get(Order, approval.order_id)
         return {"total": str(order.total), "currency": order.currency} if order else {}
     values = approval.input or {}
+    if approval.workflow == "cancel_order":
+        return {"order_id": values.get("order_id"), "reason": values.get("reason")}
     return {"sku": values.get("sku"), "qty_delta": values.get("qty_delta")}
+
+
+def _cancellation_eligibility(db, order_id: uuid.UUID) -> tuple[str | None, Order | None, Job | None]:
+    # Match the worker's job-then-order lock order to avoid a claim/cancel deadlock.
+    job = db.scalar(select(Job).where(Job.order_id == order_id).with_for_update())
+    order = db.scalar(select(Order).where(Order.order_id == order_id).with_for_update())
+    if order is None:
+        return "order_not_found", None, None
+    if order.status in ("CANCELLED", "REJECTED"):
+        return "order_not_cancellable", order, job
+    if order.status == "PENDING_APPROVAL":
+        return "order_pending_approval", order, job
+    if order.status in ("APPROVED", "PROCESSING"):
+        return "order_in_progress", order, job
+    if order.status == "CONFIRMED" and order.erp_order_id:
+        return None, order, job
+    if (not order.erp_order_id and job is not None and job.attempts == 0
+            and job.status == "QUEUED" and order.status in ("RECEIVED", "QUEUED")):
+        return None, order, job
+    if not order.erp_order_id and job is not None and job.attempts > 0:
+        return "erp_state_unknown", order, job
+    return "order_not_cancellable", order, job
+
+
+def check_cancellation_eligibility(order_id: uuid.UUID) -> tuple[int, str | None, str | None]:
+    with SessionLocal.begin() as db:
+        error, order, job = _cancellation_eligibility(db, order_id)
+        mode = "erp" if order and order.erp_order_id else "local"
+    if error == "order_not_found":
+        return 404, error, None
+    if error:
+        return 409, error, None
+    return 200, None, mode
+
+
+def create_cancellation_approval(
+    request_id: uuid.UUID, order_id: uuid.UUID, reason: str, key_id: uuid.UUID, key_name: str,
+) -> uuid.UUID:
+    approval_id = uuid.uuid4()
+    with SessionLocal.begin() as db:
+        duplicate = db.scalar(select(Approval.approval_id).where(
+            Approval.workflow == "cancel_order",
+            Approval.status.in_(("PENDING", "APPROVED")),
+            Approval.input["order_id"].as_string() == str(order_id),
+        ))
+        if duplicate:
+            raise ValueError("cancel_already_pending")
+        db.add(Approval(
+            approval_id=approval_id, request_id=request_id, workflow="cancel_order", status="PENDING",
+            order_id=None, input={"order_id": str(order_id), "reason": reason},
+            requested_by_key_id=key_id, requested_by_name=key_name,
+        ))
+    return approval_id
 
 
 def _approval_dict(db, approval: Approval) -> dict:
@@ -274,6 +334,77 @@ def _execute_stock_adjustment(approval_id: uuid.UUID, input_data: dict) -> dict:
     return result
 
 
+def _approve_cancellation(
+    approval_id: uuid.UUID, api_key: ApiKey, reason: str | None,
+) -> tuple[dict | None, str | None]:
+    with SessionLocal.begin() as db:
+        approval = db.scalar(select(Approval).where(Approval.approval_id == approval_id).with_for_update())
+        if approval is None or approval.status != "PENDING":
+            return None, approval.status if approval else None
+        input_data = approval.input or {}
+        _conditional_status(db, approval_id, "PENDING", "APPROVED", {
+            "decided_by_key_id": api_key.key_id,
+            "decided_by_name": api_key.name,
+            "decided_at": datetime.now(timezone.utc),
+            "decision_reason": reason,
+        })
+    return input_data, None
+
+
+def _execute_cancellation(
+    approval_id: uuid.UUID, input_data: dict, cancelled_by: str,
+) -> tuple[str | None, dict | None]:
+    order_id = uuid.UUID(input_data["order_id"])
+    with SessionLocal.begin() as db:
+        error, order, job = _cancellation_eligibility(db, order_id)
+        if error:
+            return error, None
+        if order.erp_order_id:
+            erp_order_id = order.erp_order_id
+            mode = "erp"
+        else:
+            if job is None or job.status != "QUEUED":
+                return "order_in_progress", None
+            job.status = "CANCELLED"
+            job.locked_at = None
+            job.updated_at = datetime.now(timezone.utc)
+            order.status = "CANCELLED"
+            db.add(AuditEvent(order_id=order_id, event_type="order.cancelled", details={
+                "approval_id": str(approval_id), "cancelled_by": cancelled_by, "mode": "local",
+                "reason": input_data["reason"],
+            }))
+            result = {"order_id": str(order_id), "status": "CANCELLED", "mode": "local"}
+            _conditional_status(db, approval_id, "APPROVED", "EXECUTED", {"result": result})
+            return None, result
+
+    reference = f"GW-CANCEL:{approval_id}"
+    adapter = get_adapter()
+    adapter_result = adapter.cancel_order(reference, erp_order_id, input_data["reason"])
+    if (not isinstance(adapter_result, dict) or not isinstance(adapter_result.get("cancel_id"), str)
+            or type(adapter_result.get("applied")) is not bool):
+        raise ValueError("ERP adapter returned an invalid cancellation result")
+    try:
+        with SessionLocal.begin() as db:
+            order = db.scalar(select(Order).where(Order.order_id == order_id).with_for_update())
+            if order is None:
+                raise RuntimeError(f"Order disappeared after ERP cancellation order_id={order_id}")
+            order.status = "CANCELLED"
+            db.add(AuditEvent(order_id=order_id, event_type="order.cancelled", details={
+                "approval_id": str(approval_id), "cancelled_by": cancelled_by, "mode": mode,
+                "reason": input_data["reason"],
+            }))
+            result = {"order_id": str(order_id), "status": "CANCELLED", "mode": mode}
+            _conditional_status(db, approval_id, "APPROVED", "EXECUTED", {"result": result})
+    except Exception as exc:
+        raise LocalCancellationUpdateError(f"Local update failed after ERP cancellation order_id={order_id}") from exc
+    return None, result
+
+
+def _fail_cancellation(approval_id: uuid.UUID, error: str) -> None:
+    with SessionLocal.begin() as db:
+        _conditional_status(db, approval_id, "APPROVED", "EXECUTION_FAILED", {"result": {"error": error}})
+
+
 def _decision_response(request_id: uuid.UUID, status: int, body: dict) -> JSONResponse:
     return JSONResponse(status_code=status, content=body, headers={"X-Request-Id": str(request_id)})
 
@@ -354,6 +485,69 @@ async def decide(request: Request, approval_id: str):
         return _decision_response(request_id, 200, {
             "request_id": str(request_id), "approval_id": str(parsed_id), "status": "EXECUTED",
             "order_id": str(order_id),
+        })
+
+    if approval.workflow == "cancel_order":
+        input_data, current_status = await run_in_threadpool(
+            _approve_cancellation, parsed_id, api_key, payload.reason,
+        )
+        if input_data is None:
+            status, body = await run_in_threadpool(
+                _deny, request_id, api_key, approval, input_hash, 409, "already_decided", {"status": current_status},
+            )
+            return _decision_response(request_id, status, body)
+        await _record_approved(request_id, api_key, approval, input_hash, payload.reason)
+        try:
+            error, result = await run_in_threadpool(_execute_cancellation, parsed_id, input_data, api_key.name)
+        except LocalCancellationUpdateError as exc:
+            order_id = uuid.UUID(input_data["order_id"])
+            logger.exception("Local update failed after ERP cancellation approval_id=%s order_id=%s", parsed_id, order_id)
+            await run_in_threadpool(
+                _event, request_id=request_id, api_key=api_key, workflow=approval.workflow,
+                input_hash=input_hash, event_type="workflow.failed", status=500,
+                approval_id=parsed_id, order_id=order_id, detail={"error": "local_update_failed"},
+            )
+            return _decision_response(request_id, 500, {
+                "request_id": str(request_id), "approval_id": str(parsed_id),
+                "status": "APPROVED", "error": "local_update_failed",
+            })
+        except Exception as exc:
+            retryable, reason = classify_failure(error=exc)
+            error_code = reason[:200]
+            order_id = input_data.get("order_id")
+            logger.exception("Cancellation execution failed approval_id=%s order_id=%s", parsed_id, order_id)
+            await run_in_threadpool(_fail_cancellation, parsed_id, error_code)
+            status = 502 if retryable else 422
+            await run_in_threadpool(
+                _event, request_id=request_id, api_key=api_key, workflow=approval.workflow,
+                input_hash=input_hash, event_type="workflow.failed", status=status,
+                approval_id=parsed_id, order_id=uuid.UUID(order_id), detail={"error": error_code},
+            )
+            return _decision_response(request_id, status, {
+                "request_id": str(request_id), "approval_id": str(parsed_id),
+                "status": "EXECUTION_FAILED", "error": error_code,
+            })
+        if error:
+            await run_in_threadpool(_fail_cancellation, parsed_id, error)
+            order_id = uuid.UUID(input_data["order_id"])
+            await run_in_threadpool(
+                _event, request_id=request_id, api_key=api_key, workflow=approval.workflow,
+                input_hash=input_hash, event_type="workflow.failed", status=409,
+                approval_id=parsed_id, order_id=order_id, detail={"error": error},
+            )
+            return _decision_response(request_id, 409, {
+                "request_id": str(request_id), "approval_id": str(parsed_id),
+                "status": "EXECUTION_FAILED", "error": error,
+            })
+        order_id = uuid.UUID(result["order_id"])
+        await run_in_threadpool(
+            _event, request_id=request_id, api_key=api_key, workflow=approval.workflow,
+            input_hash=input_hash, event_type="workflow.executed", status=200,
+            approval_id=parsed_id, order_id=order_id, detail={"result": result},
+        )
+        return _decision_response(request_id, 200, {
+            "request_id": str(request_id), "approval_id": str(parsed_id),
+            "status": "EXECUTED", "result": result,
         })
 
     input_data, current_status = await run_in_threadpool(

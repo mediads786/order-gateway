@@ -8,6 +8,7 @@ from decimal import Decimal, InvalidOperation
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
+from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
 
 from app.governance.audit import write_event
@@ -133,6 +134,38 @@ async def run_governed_request(
         body = {"error": "invalid_request", "request_id": str(request_id)}
         await _record(api_key, request_id, name, input_hash, "workflow.rejected", 422, detail=body)
         return 422, body
+    if name == "cancel_order":
+        try:
+            validated_cancel = workflow.input_model.model_validate(input_data)
+        except ValidationError as exc:
+            return await _reject_request_body(
+                api_key, request_id, name, input_hash, 422,
+                {"error": "invalid_request", "request_id": str(request_id), **_validation_detail(exc)},
+            )
+        from app.governance.approvals import check_cancellation_eligibility, create_cancellation_approval
+        order_id = validated_cancel.order_id
+        status, error, _ = await run_in_threadpool(check_cancellation_eligibility, order_id)
+        if error:
+            body = {"error": error, "request_id": str(request_id)}
+            await _record(api_key, request_id, name, input_hash, "workflow.rejected", status,
+                          order_id=order_id if error != "order_not_found" else None, detail={"error": error})
+            return status, body
+        try:
+            approval_id = await run_in_threadpool(
+                create_cancellation_approval, request_id, order_id, validated_cancel.reason,
+                api_key.key_id, api_key.name,
+            )
+        except (IntegrityError, ValueError) as exc:
+            if isinstance(exc, ValueError) and str(exc) != "cancel_already_pending":
+                raise
+            body = {"error": "cancel_already_pending", "request_id": str(request_id)}
+            await _record(api_key, request_id, name, input_hash, "workflow.rejected", 409,
+                          order_id=order_id, detail={"error": "cancel_already_pending"})
+            return 409, body
+        await _record(api_key, request_id, name, input_hash, "workflow.approval_requested", 202,
+                      order_id=order_id, detail={"approval_id": str(approval_id)})
+        return 202, {"request_id": str(request_id), "workflow": name,
+                     "approval_id": str(approval_id), "status": "PENDING_APPROVAL"}
     if not workflow.executable:
         try:
             workflow.input_model.model_validate(input_data)

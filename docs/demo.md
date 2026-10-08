@@ -213,3 +213,78 @@ Start-Process "$Api/admin/workflow-events"
 ```
 
 The small order follows normal intake after confirmation. The large order waits for the approver, and unsupported or instruction-like sentences remain `INVALID` under the rule proposer.
+
+## Cancellation demo (about 60 seconds)
+
+Start with the Compose stack and migrations running. The admin web page uses the configured `ADMIN_TOKEN` from `.env`; the admin API key below is separate.
+
+```powershell
+$Api = "http://localhost:8002"
+$run = [guid]::NewGuid().ToString().Substring(0, 6)
+function New-CancelDemoKey($role) {
+  $output = docker compose exec -T api python -m scripts.api_keys create --name "cancel-$role-$run" --role $role 2>&1 | Out-String
+  $match = [regex]::Match($output, 'gw_[A-Za-z0-9_\-]+')
+  if (-not $match.Success) { Write-Host $output; throw "Could not read the new $role key" }
+  return $match.Value
+}
+$OperatorKey = New-CancelDemoKey "operator"
+$ApproverKey = New-CancelDemoKey "approver"
+$AdminKey = New-CancelDemoKey "admin"
+function Invoke-CancelDemo($Method, $Path, $Key, $Body = $null, $ExtraHeaders = @{}) {
+  $headers = @{ "X-API-Key" = $Key }
+  foreach ($name in $ExtraHeaders.Keys) { $headers[$name] = $ExtraHeaders[$name] }
+  try {
+    if ($null -ne $Body) {
+      $r = Invoke-WebRequest -UseBasicParsing -Method $Method -Uri "$Api$Path" -Headers $headers -ContentType "application/json" -Body $Body
+    } else {
+      $r = Invoke-WebRequest -UseBasicParsing -Method $Method -Uri "$Api$Path" -Headers $headers
+    }
+    $code = [int]$r.StatusCode; $content = $r.Content
+  } catch [System.Net.WebException] {
+    $response = $_.Exception.Response
+    if ($null -eq $response) { throw }
+    $code = [int]$response.StatusCode
+    $reader = [IO.StreamReader]::new($response.GetResponseStream())
+    try { $content = $reader.ReadToEnd() } finally { $reader.Dispose(); $response.Dispose() }
+  }
+  Write-Host "HTTP $code $content"
+  try { return ($content | ConvertFrom-Json) } catch { return $null }
+}
+Invoke-CancelDemo GET "/workflows" $AdminKey | Out-Null
+
+# Create and wait for an ERP-confirmed order; preserve the normal idempotency header.
+$idem = [guid]::NewGuid().ToString()
+$orderBody = '{"source":"manual","customer":{"name":"Cancel Demo","email":"cancel@example.com"},"currency":"USD","lines":[{"sku":"ABC","qty":1,"unit_price":"2.00"}]}'
+$created = Invoke-CancelDemo POST "/workflows/create_order/requests" $OperatorKey (@{ input = ($orderBody | ConvertFrom-Json) } | ConvertTo-Json -Depth 6 -Compress) @{ "Idempotency-Key" = $idem }
+$orderId = $created.result.order_id
+for ($i = 0; $i -lt 30; $i++) {
+  $order = Invoke-RestMethod -UseBasicParsing -Uri "$Api/orders/$orderId"
+  if ($order.status -eq "CONFIRMED") { break }
+  Start-Sleep -Seconds 2
+}
+
+# Request, prove requester self-approval is forbidden, then approve as a separate key.
+$cancelBody = @{ input = @{ order_id = $orderId; reason = "Demo cancellation" } } | ConvertTo-Json -Depth 4 -Compress
+$pending = Invoke-CancelDemo POST "/workflows/cancel_order/requests" $OperatorKey $cancelBody
+$approvalId = $pending.approval_id
+Invoke-CancelDemo POST "/approvals/$approvalId/decision" $OperatorKey '{"decision":"approve","reason":"Requester cannot approve"}'
+Invoke-CancelDemo POST "/approvals/$approvalId/decision" $ApproverKey '{"decision":"approve","reason":"Reviewed cancellation"}'
+$final = Invoke-RestMethod -UseBasicParsing -Uri "$Api/orders/$orderId"
+$final.status
+$final.audit_events | ConvertTo-Json -Depth 5
+
+# A timed-out/retrying order has unknown ERP state and must be refused.
+Invoke-RestMethod -UseBasicParsing -Method Post -Uri "http://127.0.0.1:9001/admin/faults" -ContentType "application/json" -Body '{"mode":"error_500"}'
+$retryKey = [guid]::NewGuid().ToString()
+$unknown = Invoke-RestMethod -UseBasicParsing -Method Post -Uri "$Api/orders" -Headers @{ "Idempotency-Key" = $retryKey } -ContentType "application/json" -Body $orderBody
+for ($i = 0; $i -lt 15; $i++) {
+  $retrying = Invoke-RestMethod -UseBasicParsing -Uri "$Api/orders/$($unknown.order_id)"
+  if ($retrying.status -eq "RETRYING" -or $retrying.status -eq "FAILED_DEAD") { break }
+  Start-Sleep -Seconds 1
+}
+$unknownCancel = @{ input = @{ order_id = $unknown.order_id; reason = "Unknown ERP outcome" } } | ConvertTo-Json -Depth 4 -Compress
+Invoke-CancelDemo POST "/workflows/cancel_order/requests" $OperatorKey $unknownCancel
+Invoke-RestMethod -UseBasicParsing -Method Post -Uri "http://127.0.0.1:9001/admin/faults" -ContentType "application/json" -Body '{"mode":"none"}'
+Start-Process "$Api/admin/orders/$orderId"
+Write-Host "Sign in with the configured ADMIN_TOKEN to inspect the cancellation audit trail."
+```

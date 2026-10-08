@@ -65,10 +65,10 @@ WORKFLOWS: dict[str, Workflow] = {
     ),
     "cancel_order": Workflow(
         name="cancel_order",
-        description="Request order cancellation; not executable in this version.",
+        description="Request order cancellation for approval.",
         risk="medium",
         request_roles=("operator", "admin"),
-        executable=False,
+        executable=True,
         approval="always",
         decision_roles=("approver", "admin"),
         input_model=CancelOrderInput,

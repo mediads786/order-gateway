@@ -125,13 +125,13 @@ def test_post_proposal_creates_no_domain_rows_or_adapter_calls(client, monkeypat
     assert response.status_code == 201
     assert response.json()["status"] == "PROPOSED"
     assert response.json()["needs_approval"] == "conditional"
-    assert fake.allowed and "cancel_order" not in {item.name for item in fake.allowed}
+    assert fake.allowed and "cancel_order" in {item.name for item in fake.allowed}
     assert row_count(Order) == row_count(Approval) == 0
     assert adapter.calls == []
     assert "order 1 BOOK" not in response.text
 
 
-@pytest.mark.parametrize("workflow", ["cancel_order", "approve_all", "not_registered"])
+@pytest.mark.parametrize("workflow", ["approve_all", "not_registered"])
 def test_disallowed_proposer_workflow_is_invalid(client, monkeypatch, workflow):
     install_fake(monkeypatch, ProposerResult(workflow, {"anything": 1}, "untrusted explanation"))
     response = post_proposal(client, create_key("operator"), "some sentence")

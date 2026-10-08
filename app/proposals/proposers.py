@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import uuid
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -35,6 +36,22 @@ class RuleProposer:
 
     def propose(self, text: str, allowed: list[AllowedWorkflow]) -> ProposerResult:
         allowed_names = {workflow.name for workflow in allowed}
+        cancellation = re.fullmatch(
+            r"\s*cancel\s+order\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12})\s+reason:\s*(.+?)\s*",
+            text, flags=re.IGNORECASE,
+        )
+        if cancellation and "cancel_order" in allowed_names:
+            order_id, reason = cancellation.groups()
+            try:
+                parsed_id = uuid.UUID(order_id)
+            except ValueError:
+                return ProposerResult(workflow=None, explanation="No supported workflow pattern matched.")
+            if reason.strip():
+                return ProposerResult(
+                    workflow="cancel_order", input={"order_id": str(parsed_id), "reason": reason.strip()},
+                    explanation=f"Request to cancel order {parsed_id}.",
+                )
         adjustment = re.fullmatch(
             r"\s*(add|remove|adjust)\s+([+-]?\d+)\s+(?:(?:of|to|for|from)\s+)?"
             r"([A-Za-z0-9._-]+).*?\breason:\s*(.+?)\s*",

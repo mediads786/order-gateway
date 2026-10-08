@@ -148,6 +148,51 @@ class OdooAdapter:
         if result is not True:
             raise ValueError("Odoo sale.order/action_confirm returned an invalid response")
 
+    def cancel_order(self, reference: str, erp_order_id: str, reason: str) -> dict:
+        approval_id = reference.removeprefix("GW-CANCEL:")
+        identity = {"order_id": erp_order_id, "approval_id": approval_id}
+        try:
+            order_id = int(erp_order_id)
+        except ValueError as exc:
+            raise NonRetryableAdapterError("odoo_order_not_found", "Invalid Odoo sale.order id") from exc
+        orders = self._call(
+            "sale.order", "search_read",
+            {"domain": [["id", "=", order_id]], "fields": ["id", "state"], "limit": 1},
+            **identity,
+        )
+        if not isinstance(orders, list) or any(not isinstance(row, dict) for row in orders):
+            raise ValueError("Odoo sale.order/search_read returned an invalid response")
+        if not orders or orders[0].get("id") != order_id:
+            raise NonRetryableAdapterError("odoo_order_not_found", "Odoo sale.order was not found")
+        if orders[0].get("state") == "cancel":
+            return {"cancel_id": reference, "applied": False}
+        offset = 0
+        while True:
+            deliveries = self._call(
+                "stock.picking", "search_read",
+                {"domain": [["sale_id", "=", order_id]], "fields": ["id", "state"],
+                 "limit": 100, "offset": offset},
+                **identity,
+            )
+            if not isinstance(deliveries, list) or any(not isinstance(row, dict) for row in deliveries):
+                raise ValueError("Odoo stock.picking/search_read returned an invalid response")
+            if any(delivery.get("state") == "done" for delivery in deliveries):
+                raise NonRetryableAdapterError("already_delivered", "already_delivered")
+            if len(deliveries) < 100:
+                break
+            offset += len(deliveries)
+        self._call("sale.order", "action_cancel", {"ids": [order_id]}, **identity)
+        final = self._call(
+            "sale.order", "search_read",
+            {"domain": [["id", "=", order_id]], "fields": ["id", "state"], "limit": 1},
+            **identity,
+        )
+        if not isinstance(final, list) or not final or not isinstance(final[0], dict):
+            raise ValueError("Odoo sale.order state readback was invalid")
+        if final[0].get("state") != "cancel":
+            raise ValueError("Odoo sale.order was not cancelled after action_cancel")
+        return {"cancel_id": reference, "applied": True}
+
     def _resolve_products(self, order: AdapterOrder, identity: dict[str, str]) -> dict[str, int]:
         skus = list(dict.fromkeys(line.sku for line in order.lines))
         records = self._call(

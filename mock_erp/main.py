@@ -17,6 +17,7 @@ fault_latency_ms = 0
 sales_orders: dict[str, dict] = {}
 external_ids: dict[str, str] = {}
 stock_adjustments: dict[str, str] = {}
+cancellations: dict[str, str] = {}
 
 
 class SalesOrderInput(BaseModel):
@@ -37,6 +38,11 @@ class StockAdjustmentInput(BaseModel):
     reference: str
     sku: str
     qty_delta: int = Field(strict=True, ne=0)
+    reason: str
+
+
+class CancellationInput(BaseModel):
+    reference: str
     reason: str
 
 
@@ -86,6 +92,41 @@ def get_sales_order(erp_order_id: str):
     if order is None:
         raise HTTPException(status_code=404, detail="ERP order not found")
     return order
+
+
+@app.post("/sales-orders/{erp_order_id}/cancel")
+async def cancel_sales_order(erp_order_id: str, cancellation: CancellationInput):
+    with lock:
+        mode = fault_mode
+        fail_rate = fault_fail_rate
+        latency_ms = fault_latency_ms
+    if latency_ms:
+        await asyncio.sleep(latency_ms / 1000)
+    if mode == "error_500":
+        raise HTTPException(status_code=500, detail="Injected ERP error")
+    if mode == "rate_limit_429":
+        raise HTTPException(status_code=429, detail="Injected ERP rate limit")
+    if mode == "error_422":
+        raise HTTPException(status_code=422, detail="Injected ERP validation error")
+    if mode == "timeout":
+        await asyncio.sleep(10)
+        raise HTTPException(status_code=504, detail="Injected ERP timeout")
+    if mode == "slow":
+        await asyncio.sleep(1)
+    if random.random() < fail_rate:
+        raise HTTPException(status_code=500, detail="Injected random ERP error")
+    with lock:
+        order = sales_orders.get(erp_order_id)
+        if order is None:
+            raise HTTPException(status_code=404, detail="ERP order not found")
+        cancel_id = cancellations.get(cancellation.reference)
+        if cancel_id:
+            return {"cancel_id": cancel_id, "applied": False}
+        cancel_id = str(uuid.uuid4())
+        cancellations[cancellation.reference] = cancel_id
+        order["status"] = "CANCELLED"
+        order["cancel_reason"] = cancellation.reason
+        return {"cancel_id": cancel_id, "applied": True}
 
 
 @app.post("/stock-adjustments")
@@ -138,4 +179,5 @@ def reset():
         sales_orders.clear()
         external_ids.clear()
         stock_adjustments.clear()
+        cancellations.clear()
     return {"status": "reset"}
