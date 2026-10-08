@@ -8,7 +8,7 @@ from app.db.session import SessionLocal
 
 
 def requeue_failed_order(
-    order_id: uuid.UUID, *, via_admin: bool = False,
+    order_id: uuid.UUID, *, via_admin: bool = False, requested_by: str | None = None,
 ) -> Literal["not_found", "no_job", "not_dead", "requeued"]:
     with SessionLocal.begin() as db:
         order = db.scalar(select(Order).where(Order.order_id == order_id).with_for_update())
@@ -29,5 +29,7 @@ def requeue_failed_order(
         details = {"previous_attempts": previous_attempts}
         if via_admin:
             details["via"] = "admin"
+        if requested_by is not None:
+            details["requested_by"] = requested_by
         db.add(AuditEvent(order_id=order_id, event_type="order.requeued", details=details))
     return "requeued"

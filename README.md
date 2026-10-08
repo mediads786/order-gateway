@@ -126,7 +126,7 @@ Follow the [3-minute operations demo](docs/demo.md), the [about-60-second govern
 
 `/admin` provides a status-filtered order list with counts, a detail page with lines, job state, shipments and the oldest-first audit trail, and a retry button for `FAILED_DEAD` orders. The shared `ADMIN_TOKEN` is compared with a constant-time check; the browser receives a signed `gw_admin` cookie, never the token itself. Admin responses disable caching and framing and use a restrictive content security policy. State changes use POST forms, and `SameSite=Strict` cookies provide the v1 CSRF protection. `ADMIN_TOKEN` must contain at least 16 characters; otherwise all admin routes return `503 admin_disabled`.
 
-The admin has one shared identity, so an admin retry audit event cannot identify an individual, and there is no login rate limiting. The API retry endpoint remains unauthenticated in v1. Cookies are marked `Secure` only when served over HTTPS; plain local HTTP does not set that attribute.
+The admin has one shared identity, so an admin retry audit event cannot identify an individual, and there is no login rate limiting. The original order endpoints are open by default; set `LEGACY_AUTH=key` to require API keys with role checks. The admin retry button remains protected by the shared admin cookie. Cookies are marked `Secure` only when served over HTTPS; plain local HTTP does not set that attribute.
 
 ## Workflow governance
 
@@ -294,6 +294,7 @@ $env:ODOO_LIVE = "1"
 | `SHIPMENT_WEBHOOK_SECRET` | empty | Shipment HMAC secret | Yes |
 | `ADMIN_TOKEN` | empty | Admin login token; minimum 16 characters | Yes |
 | `APPROVAL_THRESHOLD` | `1000.00` | Governed order total above which approval is required | No |
+| `LEGACY_AUTH` | `off` | Set to `key` to protect original order endpoints with API-key roles | No |
 | `PROPOSER` | `rule` | `rule` or optional `anthropic` proposer | No |
 | `DEFAULT_CURRENCY` | `PKR` | Currency used by the rule-based order proposal when set | No |
 | `ANTHROPIC_API_KEY` | empty | Anthropic Messages API key when `PROPOSER=anthropic` | Yes |
@@ -313,13 +314,14 @@ $env:ODOO_LIVE = "1"
 
 ## What is verified and what is not
 
-- Automated test count: `TODO — fill in after running pytest`.
+- Automated test count: `N tests passed, 1 skipped`.
 - The opt-in Odoo smoke test requires a running seeded Odoo instance and `ODOO_LIVE=1`.
 - Shopify live-store test: not yet done; mapping fixtures and signature behavior are tested locally.
 - Odoo API calls are documented in [docs/odoo-notes.md](docs/odoo-notes.md); the sale-order create flow should also be checked with the opt-in live smoke test for the Odoo instance in use.
 
 ## Known limitations
 
+- Shopify orders without a customer (Shopify sends `"customer": null`) are rejected, because the gateway requires a customer name plus an email or phone. Proven in a live test; see docs/shopify-live-test.md.
 - Shopify `total_price` is ignored; the gateway computes the total from lines.
 - A missing Shopify SKU rejects the order.
 - The same Shopify order under a different webhook ID creates a second order.
@@ -331,7 +333,7 @@ $env:ODOO_LIVE = "1"
 - Shipments are synchronous and use one warehouse.
 - Order currency must match `ODOO_EXPECTED_CURRENCY`.
 - Odoo Online plans may restrict external API access.
-- Existing `POST /orders`, Shopify, shipment, and retry endpoints bypass approvals; only governed workflows use the approval rules.
+- `POST /orders`, `GET /orders/{id}`, and `POST /orders/{id}/retry` are open by default; set `LEGACY_AUTH=key` to require API keys with role checks. Shopify and shipment webhooks remain HMAC-authenticated and are not role-based; admin pages still use the single shared `ADMIN_TOKEN`. The original order routes do not use governed approvals.
 - The threshold ignores currency, pending approvals do not expire, and decisions are available through the API only.
 - Failed `adjust_stock` approval executions are not retried automatically; a requester must submit a new request.
 - Rule-based natural-language matching supports only the two documented patterns; the optional Anthropic proposer is not tested against the live API here.

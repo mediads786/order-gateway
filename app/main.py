@@ -23,6 +23,7 @@ from app.admin.routes import router as admin_router
 from app.services.retry import requeue_failed_order
 from app.governance.routes import router as governance_router
 from app.governance.approvals import router as approvals_router
+from app.governance.legacy import legacy_guard
 from app.proposals.routes import router as proposals_router
 app = FastAPI()
 logger = logging.getLogger(__name__)
@@ -58,10 +59,18 @@ async def validate_erp_adapter_setting() -> None:
 
 @app.post("/orders")
 async def create_order(request: Request, response: Response, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    actor = await legacy_guard(request, "legacy:create_order", ("operator", "admin"))
+    if isinstance(actor, JSONResponse):
+        return actor
     if not idempotency_key:
         raise HTTPException(status_code=400, detail="Idempotency-Key header is required")
     raw_body = await request.body()
-    status_code, body = await run_in_threadpool(submit_order, raw_body, idempotency_key)
+    if actor is None:
+        status_code, body = await run_in_threadpool(submit_order, raw_body, idempotency_key)
+    else:
+        status_code, body = await run_in_threadpool(
+            submit_order, raw_body, idempotency_key, requested_by=actor.name,
+        )
     response.status_code = status_code
     return body
 
@@ -152,7 +161,14 @@ async def create_shipment(request: Request):
 
 
 @app.get("/orders/{order_id}")
-def get_order(order_id: uuid.UUID):
+async def get_order(request: Request, order_id: uuid.UUID):
+    actor = await legacy_guard(request, "legacy:get_order", ("operator", "approver", "admin"))
+    if isinstance(actor, JSONResponse):
+        return actor
+    return await run_in_threadpool(_get_order, order_id)
+
+
+def _get_order(order_id: uuid.UUID) -> dict:
     with SessionLocal() as db:
         order = db.scalar(select(Order).where(Order.order_id == order_id))
         if order is None:
@@ -165,8 +181,14 @@ def get_order(order_id: uuid.UUID):
 
 
 @app.post("/orders/{order_id}/retry")
-def retry_order(order_id: uuid.UUID):
-    result = requeue_failed_order(order_id)
+async def retry_order(request: Request, order_id: uuid.UUID):
+    actor = await legacy_guard(request, "legacy:retry_order", ("operator", "admin"))
+    if isinstance(actor, JSONResponse):
+        return actor
+    if actor is None:
+        result = await run_in_threadpool(requeue_failed_order, order_id)
+    else:
+        result = await run_in_threadpool(requeue_failed_order, order_id, requested_by=actor.name)
     if result == "not_found":
         raise HTTPException(status_code=404, detail="Order not found")
     if result == "no_job":

@@ -90,7 +90,9 @@ def _optional_text(value: object, max_length: int | None = None) -> str | None:
     return value
 
 
-def _rejected_order(payload: object, reasons: list[dict], key: str, digest: str) -> tuple[int, dict]:
+def _rejected_order(
+    payload: object, reasons: list[dict], key: str, digest: str, requested_by: str | None = None,
+) -> tuple[int, dict]:
     with SessionLocal.begin() as db:
         _lock_idempotency_key(db, key)
         previous = db.get(IdempotencyKey, key)
@@ -110,7 +112,10 @@ def _rejected_order(payload: object, reasons: list[dict], key: str, digest: str)
                       raw_payload=payload)
         db.add(order)
         db.flush()
-        db.add(AuditEvent(order_id=order.order_id, event_type="order.rejected", details={"reasons": reasons}))
+        details = {"reasons": reasons}
+        if requested_by is not None:
+            details["requested_by"] = requested_by
+        db.add(AuditEvent(order_id=order.order_id, event_type="order.rejected", details=details))
         response_body = {"order_id": str(order.order_id), "status": "REJECTED", "reasons": reasons}
         db.add(IdempotencyKey(key=key, request_hash=digest, response_json=response_body,
                               status_code=422, order_id=order.order_id))
@@ -124,28 +129,29 @@ def _validation_reasons(exc: ValidationError) -> list[dict]:
 
 def submit_order(
     raw_body: bytes, idempotency_key: str, *, hold: HoldPolicy | None = None,
+    requested_by: str | None = None,
 ) -> tuple[int, dict]:
     try:
         payload = json.loads(raw_body, parse_constant=_reject_constant)
     except NonFiniteJSON as exc:
         raw_payload = raw_body.decode("utf-8", errors="replace").replace("\x00", "\\u0000")
         digest = hashlib.sha256(raw_body).hexdigest()
-        return _rejected_order(raw_payload, [{"field": "body", "reason": str(exc)}], idempotency_key, digest)
+        return _rejected_order(raw_payload, [{"field": "body", "reason": str(exc)}], idempotency_key, digest, requested_by)
     except (json.JSONDecodeError, UnicodeDecodeError):
         raw_payload = raw_body.decode("utf-8", errors="replace").replace("\x00", "\\u0000")
         digest = hashlib.sha256(raw_body).hexdigest()
-        return _rejected_order(raw_payload, [{"field": "body", "reason": "Invalid JSON"}], idempotency_key, digest)
+        return _rejected_order(raw_payload, [{"field": "body", "reason": "Invalid JSON"}], idempotency_key, digest, requested_by)
 
     if _contains_nul(payload):
         raw_payload = raw_body.decode("utf-8", errors="replace").replace("\x00", "\\u0000")
         digest = hashlib.sha256(raw_body).hexdigest()
-        return _rejected_order(raw_payload, [{"field": "body", "reason": "NUL characters are not allowed"}], idempotency_key, digest)
+        return _rejected_order(raw_payload, [{"field": "body", "reason": "NUL characters are not allowed"}], idempotency_key, digest, requested_by)
 
     digest = _request_hash(payload)
     try:
         order_data = OrderInput.model_validate(payload)
     except ValidationError as exc:
-        return _rejected_order(payload, _validation_reasons(exc), idempotency_key, digest)
+        return _rejected_order(payload, _validation_reasons(exc), idempotency_key, digest, requested_by)
 
     with SessionLocal.begin() as db:
         _lock_idempotency_key(db, idempotency_key)
@@ -165,7 +171,8 @@ def submit_order(
                       lines=[OrderLine(sku=line.sku, qty=line.qty, unit_price=line.unit_price) for line in order_data.lines])
         db.add(order)
         db.flush()
-        db.add(AuditEvent(order_id=order.order_id, event_type="order.received", details={}))
+        received_details = {"requested_by": requested_by} if requested_by is not None else {}
+        db.add(AuditEvent(order_id=order.order_id, event_type="order.received", details=received_details))
         db.flush()
         response_status = 201
         if requires_approval:

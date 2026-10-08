@@ -288,3 +288,35 @@ Invoke-RestMethod -UseBasicParsing -Method Post -Uri "http://127.0.0.1:9001/admi
 Start-Process "$Api/admin/orders/$orderId"
 Write-Host "Sign in with the configured ADMIN_TOKEN to inspect the cancellation audit trail."
 ```
+
+## Securing the original endpoints
+
+Set `LEGACY_AUTH=key` in `.env` and restart the Compose stack. In this mode, operators and admins can create orders and retry dead orders; operators, approvers, and admins can read orders. The webhook and shipment routes remain HMAC-authenticated.
+
+This PowerShell 5.1 example reads the API key as a secure prompt and does not print it:
+
+```powershell
+$Api = "http://localhost:8002"
+$secureKey = Read-Host "Operator API key" -AsSecureString
+$keyPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureKey)
+try { $apiKey = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($keyPointer) }
+finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($keyPointer) }
+$headers = @{ "X-API-Key" = $apiKey; "Idempotency-Key" = [guid]::NewGuid().ToString() }
+$body = '{"source":"manual","customer":{"name":"Demo Customer","email":"demo@example.com"},"currency":"USD","lines":[{"sku":"ABC","qty":1,"unit_price":"2.00"}]}'
+try {
+  $created = Invoke-WebRequest -UseBasicParsing -Method Post -Uri "$Api/orders" -Headers $headers -ContentType "application/json" -Body $body
+  $order = $created.Content | ConvertFrom-Json
+  Write-Host "POST /orders: HTTP $([int]$created.StatusCode)"
+  $read = Invoke-WebRequest -UseBasicParsing -Method Get -Uri "$Api/orders/$($order.order_id)" -Headers @{ "X-API-Key" = $apiKey }
+  Write-Host "GET /orders/{id}: HTTP $([int]$read.StatusCode)"
+} catch [System.Net.WebException] {
+  $response = $_.Exception.Response
+  if ($null -eq $response) { throw }
+  Write-Host "HTTP $([int]$response.StatusCode)"
+  $reader = [IO.StreamReader]::new($response.GetResponseStream())
+  try { Write-Host ($reader.ReadToEnd()) } finally { $reader.Dispose(); $response.Dispose() }
+} finally {
+  $apiKey = $null
+  $secureKey.Dispose()
+}
+```
