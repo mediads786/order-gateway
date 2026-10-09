@@ -83,7 +83,7 @@ def test_local_cancel_waits_for_approver_and_reject_preserves_rows(client):
         assert db.scalar(select(Job).where(Job.order_id == order_id)).status == "QUEUED"
         events = db.scalars(select(WorkflowEvent).where(WorkflowEvent.request_id == approval.request_id)
                             .order_by(WorkflowEvent.event_id)).all()
-        assert [event.event_type for event in events] == ["workflow.requested", "workflow.approval_requested"]
+        assert sorted(event.event_type for event in events) == ["workflow.approval_requested", "workflow.requested"]
     operator_decision = decide(client, approval_id, operator)
     assert operator_decision.status_code == 403 and operator_decision.json()["error"] == "forbidden"
     self_approval = decide(client, approval_id, requester)

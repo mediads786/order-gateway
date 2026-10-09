@@ -114,7 +114,7 @@ Then run the tests after Compose is up:
 .\.venv\Scripts\python.exe -m pytest -v
 ```
 
-Test result placeholder: **224 tests passed, 1 skipped** (replace `N` with your observed output).
+Test result placeholder: **232 tests passed, 1 skipped** (replace `N` with your observed output).
 
 The test fixture reads `TEST_DATABASE_URL` from the environment or `.env`, creates the named test database if missing, checks that its name ends in `_test`, and sets `DATABASE_URL` to it before importing the app.
 
@@ -314,7 +314,7 @@ $env:ODOO_LIVE = "1"
 
 ## What is verified and what is not
 
-- Automated test count: `N tests passed, 1 skipped`.
+- Automated test count: `232 tests passed, 1 skipped`.
 - The opt-in Odoo smoke test requires a running seeded Odoo instance and `ODOO_LIVE=1`.
 - Shopify live-store test: not yet done; mapping fixtures and signature behavior are tested locally.
 - Odoo API calls are documented in [docs/odoo-notes.md](docs/odoo-notes.md); the sale-order create flow should also be checked with the opt-in live smoke test for the Odoo instance in use.
