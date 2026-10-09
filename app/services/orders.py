@@ -9,6 +9,7 @@ import uuid
 from pydantic import ValidationError
 from sqlalchemy import text
 
+from app.core.reasons import summarize_reasons
 from app.core.schemas import OrderInput
 from app.db.models import Approval, AuditEvent, IdempotencyKey, Job, Order, OrderLine
 from app.db.session import SessionLocal
@@ -166,7 +167,8 @@ def submit_order(
     try:
         order_data = OrderInput.model_validate(payload)
     except ValidationError as exc:
-        return _rejected_order(payload, _validation_reasons(exc), idempotency_key, digest, requested_by)
+        reasons = summarize_reasons(_validation_reasons(exc), payload)
+        return _rejected_order(payload, reasons, idempotency_key, digest, requested_by)
 
     with SessionLocal.begin() as db:
         _lock_idempotency_key(db, idempotency_key)
