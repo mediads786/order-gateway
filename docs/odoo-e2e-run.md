@@ -25,9 +25,23 @@ This record documents one run of the gateway against a local Odoo 19 instance (C
 - Odoo reported `amount_total` 23.0 for an order whose gateway total is 20.00. The difference is likely Odoo-side tax configuration; this was not investigated.
 - The first attempt failed only because `ODOO_BASE_URL` was empty (see Setup).
 
-## Not covered by this run
+## Run 2: governed stock adjustment and signed shipments
 
-- Signed shipment application against Odoo.
-- A governed stock adjustment against Odoo.
+Same setup as run 1, plus a temporary `SHIPMENT_WEBHOOK_SECRET` (shipments are signed with base64 HMAC-SHA256 over the raw request body, header `X-Gateway-Signature`). Odoo stock for `GWDEMO1` was read directly from Odoo before and after each step.
+
+| Step | Result |
+| --- | --- |
+| Governed `adjust_stock` of +10, requested by an operator key and approved by a different approver key | HTTP 202 then 200, approval `EXECUTED`; Odoo on-hand 0 to 10 |
+| Order for 4 units delivered through the worker | `CONFIRMED`, Odoo sale order created and confirmed |
+| Signed shipment of 3 units | HTTP 200, `APPLIED`, reference `GW-SHIP:<shipment id>`; Odoo on-hand 10 to 7 |
+| Identical shipment sent again | HTTP 200, same reference, Odoo on-hand stays 7 |
+| Same shipment id with a different body | HTTP 409 `shipment_id_conflict`, stock unchanged |
+| Shipment of 1000 units (more than Odoo stock) | HTTP 422 `insufficient_stock`, stock unchanged |
+| Shipment with a wrong signature | HTTP 401 |
+| Order audit trail | one `shipment.applied`; the refused oversized shipment is recorded as `shipment.failed` with `retryable: false` |
+
+## Not covered by these runs
+
 - Failure handling against Odoo (for example Odoo unavailable mid-delivery).
 - A hosted or non-local Odoo.
+- Cancelling an order whose delivery is already done in Odoo (the adapter refuses it; not verified live).
