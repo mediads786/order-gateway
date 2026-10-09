@@ -2,40 +2,50 @@
 
 ## Problem
 
-After more than 25 years in operations management, I wanted to deepen my integration engineering skills and build work I can use when offering integration services. I chose an order-to-ERP problem because an order may be accepted by one system while delivery to another is delayed, rejected, or uncertain. A client retry can create a duplicate. Operators need to see what happened and understand how to recover.
+After more than 25 years in operations management, I wanted to build integration skills I can offer as a service. Order-to-ERP is where operations and systems meet. A shop or client system accepts an order, but delivery to the ERP can be delayed, rejected or uncertain. A client retry can create a duplicate. And someone has to be able to see what happened and recover it.
 
-I built Order Gateway to learn and create a portfolio example, not to claim that every production requirement is solved. Its core path accepts a canonical order, persists it with a delivery job, calls an ERP through an adapter, and records events. Shopify webhooks, governed actions, proposals, and Odoo exercise related concerns in the same application.
+Order Gateway is my build of that problem. It is a learning project and a demonstration, not a production system, and this page says plainly what has and has not been verified.
 
 ## What I built
 
-The FastAPI application validates orders, calculates totals with `Decimal`, and writes order, lines, job, idempotency record, and initial audit events in a transaction. A separate worker delivers due jobs to the in-memory mock ERP or configured Odoo adapter. Admin pages show order and job state, audit history, approvals, workflow events, and proposals. (`app/main.py`, `app/services/orders.py`, `app/workers/worker.py`, `docker-compose.yml`.)
+The gateway accepts an order over an API, validates it, calculates the total with exact decimal arithmetic, and stores the order, its delivery job and its audit events in one database transaction. A separate worker delivers jobs to an ERP through an adapter. There are two adapters: a mock ERP with fault injection, used to practise failure handling, and an Odoo 19 adapter.
 
-Shopify orders enter through a signed webhook and map supported customer and line fields; unmappable orders are rejected with a reason. Signed shipments use a synchronous Odoo path. A workflow registry covers order creation, stock adjustment, and cancellation. Proposals create drafts that a person must confirm through the governed path. (`app/services/shopify_webhooks.py`, `app/services/shipments.py`, `app/governance/registry.py`, `app/proposals/routes.py`.)
+Around that core are a signed Shopify webhook, a workflow registry with roles and approvals for risky actions (cancellations, stock adjustments, large orders), natural-language proposals that a person must confirm, and simple admin pages. The stack is Python, FastAPI, PostgreSQL and Docker Compose. GitHub Actions runs the full test suite on every push.
 
 ## Key decisions and why
 
-I used PostgreSQL for the queue so an order and its job can commit together. The worker claims due jobs with row locks and `SKIP LOCKED`, keeping job state durable without adding a broker. (`app/services/orders.py`, `app/workers/worker.py`.)
+**Queue in PostgreSQL.** The order and its job commit together, so an order can never be saved without a job. Workers claim jobs with row locks that skip rows already taken, so several workers can share the queue without processing a job twice. The cost is that it is not built for very high throughput, and it needs no extra broker to run.
 
-I added idempotency because timeouts and webhook delivery can repeat requests. A PostgreSQL advisory transaction lock serializes concurrent uses of a key. The request hash and response are stored: the same key and body replay the response, while a different body conflicts. Shopify's webhook ID supplies its key. (`app/services/orders.py`, `app/main.py`.)
+**Idempotency keys.** Timeouts and webhook redeliveries repeat requests. The gateway stores each request's key and a hash of its body. The same key with the same body returns the original response, and the same key with a different body is refused. Shopify's webhook ID serves as its key.
 
-I kept audit history in PostgreSQL. Order and shipment changes create `audit_events`; workflow and proposal activity uses `workflow_events`, whose database trigger rejects updates and deletes. Operators can inspect the event history alongside current order state. (`app/db/models.py`, `migrations/versions/0006_workflow_governance.py`, `app/governance/audit.py`.)
+**One strict order format, one mapper per source.** Every source is translated into the same canonical order, and every ERP has its own adapter. A new client changes the mapper or the adapter, not the core. Orders that do not fit are rejected with a short reason an operator can read.
 
-For natural-language proposals, a proposer can suggest only an allowlisted workflow and schema-checked input; it cannot call an ERP. A person confirms a stored proposal, after which normal authorization and approval rules apply. Model output is a draft, not permission to change business data. (`app/proposals/proposers.py`, `app/proposals/routes.py`, `app/governance/routes.py`.)
+**Append-only audit history.** Every state change writes an event, and the workflow event table rejects updates and deletes at the database level. Operators can read the history next to the current order state.
+
+**AI proposes, people approve.** A proposal can only name a registered workflow with schema-checked input. It cannot call the ERP. A person confirms it, and the normal permission and approval rules then apply.
 
 ## How failure is handled
 
-The worker retries temporary transport, HTTP 429, and HTTP 5xx failures using exponential backoff with jitter, a cap, and a maximum attempt count. A permanent failure or exhausted retries sets the order to `FAILED_DEAD`; an operator can queue it again. Stale `PROCESSING` jobs are recovered or failed based on attempts. (`app/workers/worker.py`, `app/services/retry.py`.)
+Temporary ERP failures (timeouts, HTTP 429, HTTP 5xx) are retried with exponential backoff, jitter, a cap and a maximum number of attempts. Permanent errors, or running out of attempts, move the order to a dead state, and an operator can queue it again. Jobs stuck in processing are recovered.
 
-The demo script illustrates the sequence with the mock ERP: submit and replay an order, inject HTTP 500 for a second order, wait for `RETRYING`, clear the fault, wait for `CONFIRMED`, and print its audit trail. This is the script's scenario, not a live result. (`scripts/demo_e2e.py`, `mock_erp/main.py`.)
+I demonstrate this with a script against the mock ERP. It submits an order, replays the same request and gets the same order back, then makes the ERP return HTTP 500 for a second order. That order goes to retrying, I clear the fault, and the next attempt confirms it. The audit trail shows every step. The ERP in that run is simulated, but the retry and recovery code is what a real ERP would exercise.
 
-## What was verified live
+## What was verified
 
-The Shopify notes record a real development-store order reaching `CONFIRMED` in the mock ERP through the signed webhook and worker path. The Odoo notes record a local Odoo 19 probe of sale-order create, confirm, shipment lookup, and cancel calls. The probe is not an end-to-end gateway order and shipment run against Odoo. (`docs/shopify-live-test.md`, `docs/odoo-notes.md`.)
+- The test suite runs against a real PostgreSQL database and passes in CI on every push.
+- A real order from a Shopify development store, delivered by signed webhook, reached the confirmed state in the mock ERP.
+- A local Odoo 19 probe confirmed the order creation, confirmation, shipment lookup and cancellation calls the adapter relies on. That is a probe of the adapter's calls, not yet a full run through the gateway.
+- The failure-and-recovery demo above runs end to end.
 
 ## What is not done yet
 
-I have not deployed the project to the cloud or completed an end-to-end gateway run against Odoo that includes shipment application. The local probe does not substitute for that integration run. Live Anthropic proposer behavior is not recorded as verified. (`docs/odoo-notes.md`, `app/proposals/proposers.py`.)
+- Cloud deployment.
+- A full gateway-to-Odoo run that includes applying a shipment.
+- The optional AI proposer has not been recorded as tested against the live API.
+- The admin pages use one shared token. Per-user identity is needed before real use.
 
 ## What I would do next
 
-I would next run the full Odoo path in a development database: configure the adapter, deliver an order, confirm its ERP state, apply a signed shipment, and inspect the stock change. I would record setup and failures so adapter probes remain distinct from gateway evidence. I would then address deployment and secret management, shared admin identity, and current shipment and cancellation boundaries. The result should show how I approach integration work, what I verified, and what remains.
+First, run the full Odoo path in a development database and record what happens. Then deploy it, add per-user admin identity, and add alerting so a dead order notifies someone instead of waiting to be noticed.
+
+For a real client, I would start with their side of the connection: what they send, in what format, how it is authenticated, which field is unique per order, and what the ERP's API allows. Those answers decide the mapper and the adapter, and the rest of the design stays the same.
