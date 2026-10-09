@@ -127,6 +127,21 @@ def _validation_reasons(exc: ValidationError) -> list[dict]:
     return [{"field": ".".join(str(part) for part in error["loc"]), "reason": error["msg"]} for error in exc.errors()]
 
 
+def submit_unmappable_order(raw_body: bytes, reason: str, idempotency_key: str) -> tuple[int, dict]:
+    try:
+        payload = json.loads(raw_body, parse_constant=_reject_constant)
+    except (NonFiniteJSON, json.JSONDecodeError, UnicodeDecodeError):
+        return submit_order(raw_body, idempotency_key)
+    if _contains_nul(payload):
+        return submit_order(raw_body, idempotency_key)
+    return _rejected_order(
+        payload,
+        [{"field": "shopify_order", "reason": reason}],
+        idempotency_key,
+        _request_hash(payload),
+    )
+
+
 def submit_order(
     raw_body: bytes, idempotency_key: str, *, hold: HoldPolicy | None = None,
     requested_by: str | None = None,

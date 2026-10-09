@@ -15,7 +15,7 @@ from app.db.session import SessionLocal
 from app.adapters import get_adapter
 from app.adapters.factory import AdapterConfigurationError
 from app.core.schemas import ShipmentInput
-from app.services.orders import serialize_order, submit_order
+from app.services.orders import serialize_order, submit_order, submit_unmappable_order
 from app.services.shipments import apply_shipment, canonical_request_hash
 from app.services.shopify_webhooks import UnmappableShopifyOrder, map_shopify_order, verify_signature
 from app.admin.auth import admin_enabled
@@ -95,15 +95,18 @@ async def shopify_orders_create(request: Request):
     if topic is not None and topic != "orders/create":
         return {"status": "ignored"}
 
+    idempotency_key = f"shopify:{webhook_id}"
     try:
         payload = json.loads(raw_body)
     except (json.JSONDecodeError, UnicodeDecodeError):
-        canonical_bytes = raw_body
+        status_code, body = await run_in_threadpool(submit_order, raw_body, idempotency_key)
     else:
         try:
             canonical = map_shopify_order(payload)
-        except UnmappableShopifyOrder:
-            canonical_bytes = raw_body
+        except UnmappableShopifyOrder as exc:
+            status_code, body = await run_in_threadpool(
+                submit_unmappable_order, raw_body, str(exc), idempotency_key,
+            )
         else:
             canonical_bytes = json.dumps(
                 canonical,
@@ -111,12 +114,7 @@ async def shopify_orders_create(request: Request):
                 separators=(",", ":"),
                 ensure_ascii=False,
             ).encode("utf-8")
-
-    status_code, body = await run_in_threadpool(
-        submit_order,
-        canonical_bytes,
-        f"shopify:{webhook_id}",
-    )
+            status_code, body = await run_in_threadpool(submit_order, canonical_bytes, idempotency_key)
     if status_code in (200, 201, 422):
         return JSONResponse(
             status_code=200,
