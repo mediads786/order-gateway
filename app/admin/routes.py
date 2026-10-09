@@ -8,7 +8,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from sqlalchemy import func, select
 
 from app.admin.auth import COOKIE_NAME, authenticated, configured_token, session_cookie_value
-from app.admin.views import ORDER_STATES, PAGE_SIZE, approvals_page, login_page, order_detail_page, orders_page, proposals_page, workflow_events_page
+from app.admin.views import ORDER_STATES, PAGE_SIZE, approvals_page, login_page, not_found_page, order_detail_page, orders_page, proposals_page, workflow_events_page
 from app.db.models import Approval, AuditEvent, Job, Order, Proposal, Shipment, WorkflowEvent
 from app.db.session import SessionLocal
 from app.services.retry import requeue_failed_order
@@ -107,11 +107,11 @@ def order_detail(request: Request, order_id: str, refresh: str | None = None, ms
     try:
         parsed_id = uuid.UUID(order_id)
     except (ValueError, AttributeError):
-        return HTMLResponse("<!doctype html><html><body><h1>404</h1><p>Order not found.</p></body></html>", status_code=404)
+        return HTMLResponse(not_found_page(), status_code=404)
     with SessionLocal() as db:
         order = db.get(Order, parsed_id)
         if order is None:
-            return HTMLResponse("<!doctype html><html><body><h1>404</h1><p>Order not found.</p></body></html>", status_code=404)
+            return HTMLResponse(not_found_page(), status_code=404)
         job = db.scalar(select(Job).where(Job.order_id == parsed_id))
         shipments = db.scalars(select(Shipment).where(Shipment.order_id == parsed_id).order_by(Shipment.created_at)).all()
         events = db.scalars(
