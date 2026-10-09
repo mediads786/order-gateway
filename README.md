@@ -1,5 +1,8 @@
 # Order Gateway
 
+![CI](https://github.com/mediads786/order-gateway/actions/workflows/ci.yml/badge.svg)
+
+
 - An idempotent order intake and delivery service that stores orders in PostgreSQL, retries ERP delivery, and provides an operations view.
 
 ![Demo: ERP failure, retries, recovery](docs/demo.gif)
@@ -321,7 +324,7 @@ $env:ODOO_LIVE = "1"
 
 ## Known limitations
 
-- Shopify orders without a customer (Shopify sends `"customer": null`) are rejected, because the gateway requires a customer name plus an email or phone. Proven in a live test; see docs/shopify-live-test.md.
+- Shopify orders with no usable customer name or no email or phone (for example an order created without a customer or address) cannot be mapped and are stored as REJECTED. Proven in a live test; see docs/shopify-live-test.md.
 - Shopify `total_price` is ignored; the gateway computes the total from lines.
 - A missing Shopify SKU rejects the order.
 - The same Shopify order under a different webhook ID creates a second order.
