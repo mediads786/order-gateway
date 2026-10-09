@@ -1,0 +1,30 @@
+﻿Odoo cancel probe, run f3d18b, database gateway
+== 0. Connectivity
+  HTTP 200 
+== 1. Product and partner
+  product id: 1
+  partner id: 12
+== 2. Order A: create, confirm, cancel WITHOUT context
+-- creating order A
+  create: HTTP 200 [6] 
+  state after create: draft
+  action_confirm: HTTP 200 result: true 
+  state after confirm: sale
+  deliveries (stock.picking by sale_id): HTTP 200 [{"id": 6, "state": "confirmed"}]
+  A action_cancel (no context): HTTP 200 result: true 
+  A state after cancel: cancel
+  A deliveries after cancel: HTTP 200 [{"id": 6, "state": "cancel"}]
+  A action_cancel AGAIN on a cancelled order: HTTP 200 result: true 
+== 3. Order B: create, confirm, cancel WITH disable_cancel_warning
+-- creating order B
+  create: HTTP 200 [7] 
+  state after create: draft
+  action_confirm: HTTP 200 result: true 
+  state after confirm: sale
+  deliveries (stock.picking by sale_id): HTTP 200 [{"id": 7, "state": "confirmed"}]
+  B action_cancel (with context): HTTP 200 result: true 
+  B state after cancel: cancel
+  B deliveries after cancel: HTTP 200 [{"id": 7, "state": "cancel"}]
+
+== VERDICT
+  Plain action_cancel cancels the order (state cancel). The context key is not required.

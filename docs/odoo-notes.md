@@ -52,6 +52,16 @@ Status codes alone are not reliable; classify by `name` as well (see spec sectio
 
 `sale.order/create` with `order_line` command lists, and `sale.order` state values, are not probed. Implement from standard Odoo fields (spec section 6) and let the opt-in live smoke test confirm them.
 
-## Cancellation calls — UNVERIFIED LIVE
+## Cancellation calls - verified live (2026-10-09, Odoo 19.0, database gateway)
 
-Module 9 cancellation uses the standard JSON-2 request shape: `sale.order/search_read` with `{"domain": [["id", "=", <id>]], "fields": ["id", "state"], "limit": 1}`, paged `stock.picking/search_read` calls with `{"domain": [["sale_id", "=", <id>]], "fields": ["id", "state"], "limit": 100, "offset": <offset>}`, then `sale.order/action_cancel` with `{"ids": [<id>]}` and a final `sale.order/search_read` state check. These cancellation and delivery lookup calls have not been verified against the live instance. A `done` delivery refuses cancellation as `already_delivered`.
+Probe run f3d18b (raw report: `docs/odoo-probe/cancel-probe.txt`). All calls use the standard JSON-2 shape.
+
+| Call | Request body | Response |
+|---|---|---|
+| `sale.order/create` | `{"vals_list": [{"partner_id": 12, "client_order_ref": "GW-PROBE-A-f3d18b", "order_line": [[0, 0, {"product_id": 1, "product_uom_qty": 1, "price_unit": 2.0}]]}]}` | `[6]` (state `draft`) |
+| `sale.order/action_confirm` | `{"ids": [6]}` | `true` (state becomes `sale`) |
+| `stock.picking/search_read` | `{"domain": [["sale_id", "=", 6]], "fields": ["id", "state"], "limit": 100}` | `[{"id": 6, "state": "confirmed"}]` (the `sale_id` field exists, so `sale_stock` is installed) |
+| `sale.order/action_cancel` | `{"ids": [6]}` | `true`; the order state becomes `cancel` and its delivery state becomes `cancel` |
+| `sale.order/action_cancel` again on a cancelled order | `{"ids": [6]}` | `true` (no error) |
+
+`action_cancel` did not open a confirmation wizard in this setup: the plain call cancelled the order, and adding `{"context": {"disable_cancel_warning": true}}` gave the same result, so that context key is not needed here. The adapter's read-back of the order state after the call stays as the safety check. Not verified: cancelling an order whose delivery is already `done` (the adapter refuses that as `already_delivered` before calling `action_cancel`).
