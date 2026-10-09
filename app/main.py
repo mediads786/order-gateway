@@ -2,6 +2,8 @@ import json
 import logging
 import os
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import timezone
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
@@ -25,7 +27,23 @@ from app.governance.routes import router as governance_router
 from app.governance.approvals import router as approvals_router
 from app.governance.legacy import legacy_guard
 from app.proposals.routes import router as proposals_router
-app = FastAPI()
+
+
+def validate_erp_adapter_setting() -> None:
+    adapter = os.getenv("ERP_ADAPTER", "mock").strip().lower()
+    if adapter not in {"mock", "odoo"}:
+        raise RuntimeError(f"Unsupported ERP_ADAPTER value: {adapter!r}; expected 'mock' or 'odoo'")
+    if not admin_enabled():
+        logger.warning("Admin pages disabled: ADMIN_TOKEN is empty or shorter than 16 characters")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    validate_erp_adapter_setting()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 logger = logging.getLogger(__name__)
 app.include_router(admin_router)
 app.include_router(governance_router)
@@ -46,15 +64,6 @@ async def admin_response_headers(request: Request, call_next):
         response.headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'"
         return response
     return await call_next(request)
-
-
-@app.on_event("startup")
-async def validate_erp_adapter_setting() -> None:
-    adapter = os.getenv("ERP_ADAPTER", "mock").strip().lower()
-    if adapter not in {"mock", "odoo"}:
-        raise RuntimeError(f"Unsupported ERP_ADAPTER value: {adapter!r}; expected 'mock' or 'odoo'")
-    if not admin_enabled():
-        logger.warning("Admin pages disabled: ADMIN_TOKEN is empty or shorter than 16 characters")
 
 
 @app.post("/orders")

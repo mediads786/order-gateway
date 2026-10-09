@@ -150,14 +150,22 @@ async def run_governed_request(
             await _record(api_key, request_id, name, input_hash, "workflow.rejected", status,
                           order_id=order_id if error != "order_not_found" else None, detail={"error": error})
             return status, body
+        duplicate_cancel = False
         try:
             approval_id = await run_in_threadpool(
                 create_cancellation_approval, request_id, order_id, validated_cancel.reason,
                 api_key.key_id, api_key.name,
             )
-        except (IntegrityError, ValueError) as exc:
-            if isinstance(exc, ValueError) and str(exc) != "cancel_already_pending":
+        except IntegrityError as exc:
+            diag = getattr(getattr(exc.orig, "diag", None), "constraint_name", None)
+            if diag != "uq_approvals_open_cancel" and "uq_approvals_open_cancel" not in str(exc.orig):
                 raise
+            duplicate_cancel = True
+        except ValueError as exc:
+            if str(exc) != "cancel_already_pending":
+                raise
+            duplicate_cancel = True
+        if duplicate_cancel:
             body = {"error": "cancel_already_pending", "request_id": str(request_id)}
             await _record(api_key, request_id, name, input_hash, "workflow.rejected", 409,
                           order_id=order_id, detail={"error": "cancel_already_pending"})

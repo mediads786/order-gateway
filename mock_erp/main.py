@@ -7,7 +7,7 @@ from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 app = FastAPI()
 lock = threading.Lock()
@@ -37,8 +37,15 @@ class FaultInput(BaseModel):
 class StockAdjustmentInput(BaseModel):
     reference: str
     sku: str
-    qty_delta: int = Field(strict=True, ne=0)
+    qty_delta: int = Field(strict=True)
     reason: str
+
+    @field_validator("qty_delta")
+    @classmethod
+    def reject_zero_delta(cls, value: int) -> int:
+        if value == 0:
+            raise ValueError("qty_delta must not be zero")
+        return value
 
 
 class CancellationInput(BaseModel):

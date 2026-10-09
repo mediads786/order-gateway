@@ -590,9 +590,12 @@ async def decide(request: Request, approval_id: str):
 async def _record_approved(
     request_id: uuid.UUID, api_key: ApiKey, approval: Approval, input_hash: str, reason: str | None,
 ) -> None:
+    order_id = approval.order_id
+    if approval.workflow == "cancel_order":
+        order_id = uuid.UUID(approval.input["order_id"])
     await run_in_threadpool(
         _event, request_id=request_id, api_key=api_key, workflow=approval.workflow,
         input_hash=input_hash, event_type="workflow.approved", status=200,
-        approval_id=approval.approval_id, order_id=approval.order_id,
+        approval_id=approval.approval_id, order_id=order_id,
         detail={"decider": api_key.name, "reason": reason},
     )
