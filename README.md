@@ -5,6 +5,7 @@
 
 ![CI](https://github.com/mediads786/order-gateway/actions/workflows/ci.yml/badge.svg)
 
+- Test result placeholder: **232 tests passed, 1 skipped**
 
 - An idempotent order intake and delivery service that stores orders in PostgreSQL, retries ERP delivery, and provides an operations view.
 
