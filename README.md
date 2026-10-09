@@ -131,7 +131,7 @@ Defaults below come from `.env.example`, `docker-compose.yml`, or the code. Valu
 | `PROPOSER_TIMEOUT_SECONDS` | `20` | Proposer request timeout. |
 | `PROPOSAL_DAILY_LIMIT` | `50` | Per-key daily proposal limit. |
 | `PROPOSAL_TEXT_MAX_CHARS` | `1000` | Maximum proposal text length. |
-| `ODOO_BASE_URL` | Empty | Odoo base URL. |
+| `ODOO_BASE_URL` | Empty | Odoo base URL. With the Compose `odoo` profile use `http://odoo:8069`; the worker will not start with `ERP_ADAPTER=odoo` while it is empty. |
 | `ODOO_DB` | `gateway` | Odoo database header value. |
 | `ODOO_API_KEY` | Empty | Odoo JSON-2 bearer credential. |
 | `ODOO_EXPECTED_CURRENCY` | `USD` | Currency accepted by the Odoo order adapter. |
@@ -149,7 +149,7 @@ Defaults below come from `.env.example`, `docker-compose.yml`, or the code. Valu
 - The original order routes are open by default unless `LEGACY_AUTH=key` is enabled. The admin uses one shared token and has no per-user identity or login rate limiting. (See [app/governance/legacy.py](app/governance/legacy.py), [app/admin/auth.py](app/admin/auth.py), and [app/main.py](app/main.py).)
 - Shopify supports only the `orders/create` topic. Orders that lack a usable name or both email and phone cannot be mapped; a different webhook ID for the same Shopify order is a different idempotency key. See [docs/shopify-live-test.md](docs/shopify-live-test.md).
 - Shipments are synchronous and the Odoo implementation uses one configured warehouse. There is no cumulative shipped-versus-ordered quantity check, and counted-quantity updates can race with other Odoo stock changes. (See [app/services/shipments.py](app/services/shipments.py) and [app/adapters/odoo.py](app/adapters/odoo.py).)
-- Odoo operations are not demonstrated as a full gateway-to-Odoo end-to-end flow here. The local probe record documents specific API calls; consult [docs/odoo-notes.md](docs/odoo-notes.md) for which calls were and were not verified.
+- One gateway-to-Odoo run is recorded (order delivery and a governed cancel; see [docs/odoo-e2e-run.md](docs/odoo-e2e-run.md)). Signed shipments and governed stock adjustments have not been run against Odoo. [docs/odoo-notes.md](docs/odoo-notes.md) records which individual API calls were probed.
 - Pending approvals do not expire. An order with unknown ERP state may be refused for cancellation, and a crash between an ERP cancellation and the gateway update may leave an approval requiring manual recovery. (See [app/governance/approvals.py](app/governance/approvals.py).)
 - Anthropic proposer behavior is not recorded as live-API verified. Proposal text is retained in the database, and confirming a failed proposal does not automatically retry it. (See [app/proposals/routes.py](app/proposals/routes.py) and [app/proposals/service.py](app/proposals/service.py).)
 
@@ -159,3 +159,4 @@ Defaults below come from `.env.example`, `docker-compose.yml`, or the code. Valu
 - [Case study](docs/case-study.md)
 - [Shopify live test notes](docs/shopify-live-test.md)
 - [Odoo JSON-2 notes](docs/odoo-notes.md)
+- [Odoo end-to-end run](docs/odoo-e2e-run.md)

@@ -34,18 +34,18 @@ I demonstrate this with a script against the mock ERP. It submits an order, repl
 
 - The test suite runs against a real PostgreSQL database and passes in CI on every push.
 - A real order from a Shopify development store, delivered by signed webhook, reached the confirmed state in the mock ERP.
-- A local Odoo 19 probe confirmed the order creation, confirmation, shipment lookup and cancellation calls the adapter relies on. That is a probe of the adapter's calls, not yet a full run through the gateway.
+- An end-to-end run against a local Odoo 19: an order submitted to the gateway was delivered by the worker and appears in Odoo as a confirmed sale order, and a governed cancellation (requested by one user, approved by another) turned it into a cancelled sale order in Odoo. An earlier probe had already confirmed the individual Odoo API calls the adapter relies on.
 - The failure-and-recovery demo above runs end to end.
 
 ## What is not done yet
 
 - Cloud deployment.
-- A full gateway-to-Odoo run that includes applying a shipment.
+- Applying a shipment and a governed stock adjustment have not yet been run end to end against Odoo.
 - The optional AI proposer has not been recorded as tested against the live API.
 - The admin pages use one shared token. Per-user identity is needed before real use.
 
 ## What I would do next
 
-First, run the full Odoo path in a development database and record what happens. Then deploy it, add per-user admin identity, and add alerting so a dead order notifies someone instead of waiting to be noticed.
+First, run shipments and stock adjustments against Odoo the same way and record what happens. Then deploy it, add per-user admin identity, and add alerting so a dead order notifies someone instead of waiting to be noticed.
 
 For a real client, I would start with their side of the connection: what they send, in what format, how it is authenticated, which field is unique per order, and what the ERP's API allows. Those answers decide the mapper and the adapter, and the rest of the design stays the same.
