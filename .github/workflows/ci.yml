@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # conftest.py creates this database on the compose Postgres if it does not exist.
+      TEST_DATABASE_URL: postgresql+psycopg://order_gateway:order_gateway@127.0.0.1:5433/order_gateway_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start Postgres, mock ERP, API and worker
+        run: docker compose up -d --build --wait
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Show container logs on failure
+        if: failure()
+        run: docker compose logs --tail 200
+
+      - name: Stop containers
+        if: always()
+        run: docker compose down -v
