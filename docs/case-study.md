@@ -10,17 +10,17 @@ Order Gateway is my build of that problem. It is a learning project and a demons
 
 The gateway accepts an order over an API, validates it, calculates the total with exact decimal arithmetic, and stores the order, its delivery job and its audit events in one database transaction. A separate worker delivers jobs to an ERP through an adapter. There are two adapters: a mock ERP with fault injection, used to practise failure handling, and an Odoo 19 adapter.
 
-Around that core are a signed Shopify webhook, a workflow registry with roles and approvals for risky actions (cancellations, stock adjustments, large orders), natural-language proposals that a person must confirm, and simple admin pages. The stack is Python, FastAPI, PostgreSQL and Docker Compose. GitHub Actions runs the full test suite on every push.
+Around that core are a signed Shopify webhook, a workflow registry with roles and approvals for risky actions (cancellations, stock adjustments, large orders), natural-language proposals that a person must confirm, and simple admin pages. The stack is Python, FastAPI, PostgreSQL and Docker Compose. GitHub Actions runs the test suite on every push to the master branch; the optional live Odoo test is skipped unless it is enabled.
 
 ## Key decisions and why
 
-**Queue in PostgreSQL.** The order and its job commit together, so an order can never be saved without a job. Workers claim jobs with row locks that skip rows already taken, so several workers can share the queue without processing a job twice. The cost is that it is not built for very high throughput, and it needs no extra broker to run.
+**Queue in PostgreSQL.** An accepted order and its delivery job commit together, so one cannot be saved without the other. Workers claim jobs with row locks that skip rows already taken, so several workers can share the queue without claiming the same job at the same time. A job stuck in processing is reclaimed after a timeout, so delivery is at-least-once rather than exactly-once. The cost is that it is not built for very high throughput, and it needs no extra broker to run.
 
 **Idempotency keys.** Timeouts and webhook redeliveries repeat requests. The gateway stores each request's key and a hash of its body. The same key with the same body returns the original response, and the same key with a different body is refused. Shopify's webhook ID serves as its key.
 
-**One strict order format, one mapper per source.** Every source is translated into the same canonical order, and every ERP has its own adapter. A new client changes the mapper or the adapter, not the core. Orders that do not fit are rejected with a short reason an operator can read.
+**One strict order format, one mapper per source.** Every source is translated into the same canonical order, and every ERP has its own adapter. A new client usually means a new mapper or adapter; the core stays largely the same. Orders that do not fit are rejected with a short reason an operator can read.
 
-**Append-only audit history.** Every state change writes an event, and the workflow event table rejects updates and deletes at the database level. Operators can read the history next to the current order state.
+**Append-only audit history.** State changes write audit events, and the workflow event table rejects updates and deletes at the database level. Some workflow decision events are written in a separate step from the change itself, which is a known limit. Operators can read the history next to the current order state.
 
 **AI proposes, people approve.** A proposal can only name a registered workflow with schema-checked input. It cannot call the ERP. A person confirms it, and the normal permission and approval rules then apply.
 
@@ -32,10 +32,11 @@ I demonstrate this with a script against the mock ERP. It submits an order, repl
 
 ## What was verified
 
-- The test suite runs against a real PostgreSQL database and passes in CI on every push.
+- The test suite runs against a real PostgreSQL database, and the CI workflow runs it on every push to the master branch.
 - A real order from a Shopify development store, delivered by signed webhook, reached the confirmed state in the mock ERP.
 - An end-to-end run against a local Odoo 19: an order submitted to the gateway was delivered by the worker and appears in Odoo as a confirmed sale order, and a governed cancellation (requested by one user, approved by another) turned it into a cancelled sale order in Odoo. A second run applied a governed stock adjustment and then signed shipments: Odoo stock moved by exactly the expected amounts, a replayed shipment changed nothing, a reused shipment id with a different body was refused, and a shipment larger than the available stock was refused. An earlier probe had already confirmed the individual Odoo API calls the adapter relies on.
 - The failure-and-recovery demo above runs end to end.
+- Independent read-only code reviews. They found input-validation, shipment-handling and idempotency problems; the confirmed ones were fixed with regression tests, and the remaining concurrency and recovery limits are listed in the README.
 
 ## What is not done yet
 
