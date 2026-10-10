@@ -1,9 +1,11 @@
 .venv/
 .env
+.env.*
+!.env.example
 __pycache__/
 .pytest_cache/
 *.pyc
-
-order-gateway-project-guide.md
-
+*.bak*
+test-out.txt
+test-err.txt
 order-gateway-project-guide.md
