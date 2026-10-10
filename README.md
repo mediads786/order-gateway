@@ -160,3 +160,4 @@ Defaults below come from `.env.example`, `docker-compose.yml`, or the code. Valu
 - [Shopify live test notes](docs/shopify-live-test.md)
 - [Odoo JSON-2 notes](docs/odoo-notes.md)
 - [Odoo end-to-end run](docs/odoo-e2e-run.md)
+- [Architecture decision records](docs/adr/README.md)
