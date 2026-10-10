@@ -153,6 +153,16 @@ Defaults below come from `.env.example`, `docker-compose.yml`, or the code. Valu
 - Pending approvals do not expire. An order with unknown ERP state may be refused for cancellation, and a crash between an ERP cancellation and the gateway update may leave an approval requiring manual recovery. (See [app/governance/approvals.py](app/governance/approvals.py).)
 - Anthropic proposer behavior is not recorded as live-API verified. Proposal text is retained in the database, and confirming a failed proposal does not automatically retry it. (See [app/proposals/routes.py](app/proposals/routes.py) and [app/proposals/service.py](app/proposals/service.py).)
 
+- Odoo stock changes use counted-quantity updates, so concurrent stock operations on the same product can overwrite each other. Gateway-side locking only serializes identical shipment requests.
+- Confirming a proposal commits the governed action and proposal status in separate steps. A crash between them can leave the proposal unconfirmed; confirming a stock-adjustment proposal again could create a second approval.
+- Odoo order creation checks for an existing order and creates one in separate calls, so overlapping attempts could create two orders.
+- A worker result is not checked against the attempt that claimed the job. Approvals interrupted mid-execution can stay in APPROVED without automatic recovery.
+- Manual retry and cancellation lock the order and job in opposite orders. Concurrent requests on the same dead order can deadlock; PostgreSQL aborts one of them.
+- A shipment and cancellation of the same order are not coordinated. Replaying an applied shipment after cancellation returns order_not_confirmed.
+- Order audit events rely on application code to remain append-only; only workflow events have a database trigger.
+- The original /orders route accepts any order size or value without the governed approval threshold, even with LEGACY_AUTH=key.
+- /health always reports healthy, so it does not detect a stopped worker.
+
 ## Further reading
 
 - [Architecture](docs/architecture.md)

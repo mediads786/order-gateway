@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import math
 from datetime import timezone
 from dataclasses import dataclass
 from decimal import Decimal
@@ -45,6 +46,13 @@ def _replay_status(status_code: int) -> int:
 
 def _reject_constant(value: str) -> None:
     raise NonFiniteJSON(f"Non-finite number {value} is not allowed")
+
+
+def _parse_finite_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise NonFiniteJSON(f"Non-finite number {value} is not allowed")
+    return parsed
 
 
 def _contains_nul(value: object) -> bool:
@@ -130,7 +138,7 @@ def _validation_reasons(exc: ValidationError) -> list[dict]:
 
 def submit_unmappable_order(raw_body: bytes, reason: str, idempotency_key: str) -> tuple[int, dict]:
     try:
-        payload = json.loads(raw_body, parse_constant=_reject_constant)
+        payload = json.loads(raw_body, parse_constant=_reject_constant, parse_float=_parse_finite_float)
     except (NonFiniteJSON, json.JSONDecodeError, UnicodeDecodeError):
         return submit_order(raw_body, idempotency_key)
     if _contains_nul(payload):
@@ -148,7 +156,7 @@ def submit_order(
     requested_by: str | None = None,
 ) -> tuple[int, dict]:
     try:
-        payload = json.loads(raw_body, parse_constant=_reject_constant)
+        payload = json.loads(raw_body, parse_constant=_reject_constant, parse_float=_parse_finite_float)
     except NonFiniteJSON as exc:
         raw_payload = raw_body.decode("utf-8", errors="replace").replace("\x00", "\\u0000")
         digest = hashlib.sha256(raw_body).hexdigest()
@@ -177,6 +185,8 @@ def submit_order(
             if previous.request_hash != digest:
                 return 409, {"detail": "Idempotency-Key was used with a different request body"}
             return _replay_status(previous.status_code), previous.response_json
+        # At most 200 * 1000000 * 999999999.9999: 18 integer + 4 fractional digits.
+        # The default Decimal precision of 28 therefore keeps every operation exact.
         total = sum((line.unit_price * line.qty for line in order_data.lines), Decimal("0"))
         requires_approval = hold is not None and total > hold.threshold
         approval_id = uuid.uuid4() if requires_approval else None

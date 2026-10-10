@@ -1,5 +1,6 @@
 services:
   db:
+    restart: unless-stopped
     image: postgres:16
     environment:
       POSTGRES_DB: order_gateway
@@ -15,6 +16,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
   api:
+    restart: unless-stopped
     build: .
     environment:
       DATABASE_URL: postgresql+psycopg://order_gateway:order_gateway@db:5432/order_gateway
@@ -49,6 +51,7 @@ services:
       db:
         condition: service_healthy
   mock_erp:
+    restart: unless-stopped
     build: .
     command: ["uvicorn", "mock_erp.main:app", "--host", "0.0.0.0", "--port", "9001"]
     ports:
@@ -59,6 +62,7 @@ services:
       timeout: 2s
       retries: 15
   worker:
+    restart: unless-stopped
     build: .
     command: ["python", "-m", "app.workers.worker"]
     environment:
@@ -101,7 +105,7 @@ services:
       USER: ${ODOO_PG_USER:-odoo}
       PASSWORD: ${ODOO_PG_PASSWORD:-odoo-dev-password}
     ports:
-      - "8069:8069"
+      - "127.0.0.1:8069:8069"
     volumes:
       - odoo_filestore:/var/lib/odoo
     command: ["odoo", "-d", "gateway", "--db-filter=^gateway$"]

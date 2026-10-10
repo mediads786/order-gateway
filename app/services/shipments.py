@@ -19,6 +19,12 @@ logger = logging.getLogger(__name__)
 async def apply_shipment(shipment_id: str, order_id: uuid.UUID, lines: list[dict[str, str | int]], request_hash: str,
                          adapter: ErpAdapter) -> tuple[int, dict]:
     canonical_lines = [{"sku": line["sku"], "qty": line["qty"]} for line in lines]
+    seen_skus: set[str] = set()
+    for line in canonical_lines:
+        sku = line["sku"]
+        if sku in seen_skus:
+            return 422, {"error": f"duplicate_sku:{sku}"}
+        seen_skus.add(sku)
     with SessionLocal.begin() as db:
         order = db.get(Order, order_id)
         if order is None:
