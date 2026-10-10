@@ -10,7 +10,7 @@ Stock adjustment, cancellation, and large orders are sensitive actions. The proj
 
 ## Decision
 
-Register create_order, adjust_stock, and cancel_order with schemas and role rules. Authenticate governed requests with hashed API keys for operator, approver, and admin roles. Hold governed orders above APPROVAL_THRESHOLD, and always require approval for stock adjustment and cancellation. Require a different authorized key to decide, with a database constraint preventing self-decision. Unapproved governed actions do not reach the ERP, and decisions are audited. The registry arrived October 7; approval execution arrived October 8.
+Register create_order, adjust_stock, and cancel_order with schemas and role rules. Authenticate governed requests with hashed API keys for operator, approver, and admin roles. Hold governed orders above APPROVAL_THRESHOLD, and always require approval for stock adjustment and cancellation. Require a different authorized key to decide, with a database constraint preventing self-decision. Unapproved governed actions do not reach the ERP, and decisions are audited (decision events are written in a separate step, see [Known limitations](../../README.md#known-limitations)). The registry arrived October 7; approval execution arrived October 8.
 
 ## Consequences
 

@@ -12,7 +12,7 @@ Order Gateway is a FastAPI application backed by PostgreSQL. Docker Compose star
 
 ## Order and job states
 
-Order state names used in code are `RECEIVED`, `REJECTED`, `PENDING_APPROVAL`, `APPROVED`, `QUEUED`, `PROCESSING`, `CONFIRMED`, `RETRYING`, `FAILED_DEAD`, and `CANCELLED`. Ordinary valid intake creates `RECEIVED`; a job is created as `QUEUED`. Worker claims change both to `PROCESSING`; success changes the order to `CONFIRMED`. A retryable failure with attempts remaining changes the order to `RETRYING` and schedules the job as `QUEUED`. Permanent or exhausted failure changes the order to `FAILED_DEAD`. A manual retry changes that order and failed job back to `QUEUED`. Invalid input is `REJECTED`. Governed order approval uses `PENDING_APPROVAL`, then passes through approval before queueing; an approval rejection sets the order to `CANCELLED`. Cancellation can also set an eligible order and its job to `CANCELLED`. (`app/services/orders.py`, `app/workers/worker.py`, `app/services/retry.py`, `app/governance/approvals.py`.)
+Order state names used in code are `RECEIVED`, `REJECTED`, `PENDING_APPROVAL`, `APPROVED`, `QUEUED`, `PROCESSING`, `CONFIRMED`, `RETRYING`, `FAILED_DEAD`, and `CANCELLED`. Ordinary valid intake keeps the order in `RECEIVED` while its job is `QUEUED`. Worker claims change both to `PROCESSING`; success changes the order to `CONFIRMED`. A retryable failure with attempts remaining changes the order to `RETRYING` and schedules the job as `QUEUED`. Permanent or exhausted failure changes the order to `FAILED_DEAD`. A manual retry changes that order and failed job back to `QUEUED`. Invalid input is `REJECTED`. Governed intake above the approval threshold starts at `PENDING_APPROVAL`, then passes through approval before queueing; an approval rejection sets the order to `CANCELLED`. Cancellation can also set an eligible order and its job to `CANCELLED`. (`app/services/orders.py`, `app/workers/worker.py`, `app/services/retry.py`, `app/governance/approvals.py`.)
 
 Job states used in code are `QUEUED`, `PROCESSING`, `DONE`, `FAILED`, and `CANCELLED`. A successful worker delivery ends with job `DONE`; a permanent or exhausted delivery failure ends with job `FAILED`. Retrying is represented by an order state of `RETRYING` and a job state of `QUEUED`, with `next_attempt_at` controlling when it is due. (`app/workers/worker.py`, `app/governance/approvals.py`, `app/db/models.py`.)
 
@@ -20,8 +20,8 @@ Job states used in code are `QUEUED`, `PROCESSING`, `DONE`, `FAILED`, and `CANCE
 stateDiagram-v2
   [*] --> RECEIVED: accepted order
   [*] --> REJECTED: invalid order
-  RECEIVED --> QUEUED: job created
-  RECEIVED --> PENDING_APPROVAL: governed order over threshold
+  RECEIVED --> PROCESSING: worker claims QUEUED job
+  [*] --> PENDING_APPROVAL: governed order over threshold
   PENDING_APPROVAL --> APPROVED: approval granted
   APPROVED --> QUEUED: job created
   PENDING_APPROVAL --> CANCELLED: approval rejected
@@ -38,11 +38,13 @@ stateDiagram-v2
 
 ## Retry policy and queue
 
-The worker defaults to a one-second idle poll, five maximum attempts, a two-second backoff base, a 60-second backoff cap, and a 120-second stale-job threshold. Backoff grows exponentially by attempt and is randomized between one half and the full calculated delay, capped at 60 seconds. HTTP 429, HTTP 5xx, transport errors, and invalid adapter responses are retryable; permanent adapter errors and other HTTP errors are not. A due job is selected in `created_at`/due order and locked with PostgreSQL `FOR UPDATE SKIP LOCKED`, so a competing worker can claim a different row. Stale `PROCESSING` jobs are recovered or failed based on remaining attempts. (`app/workers/worker.py`.)
+The worker defaults to a one-second idle poll, five maximum attempts, a two-second backoff base, a 60-second backoff cap, and a 120-second stale-job threshold. Backoff grows exponentially by attempt and is randomized between one half and the full calculated delay, capped at 60 seconds. HTTP 429, HTTP 5xx, transport errors, and invalid adapter responses (including malformed successful JSON shapes reported as ValueError) are retryable; permanent adapter errors and other HTTP errors are not. A due job is selected in `created_at`/due order and locked with PostgreSQL `FOR UPDATE SKIP LOCKED`, so a competing worker can claim a different row. Stale `PROCESSING` jobs are recovered or failed based on remaining attempts. (`app/workers/worker.py`.)
 
 ## Idempotency
 
 `POST /orders` requires `Idempotency-Key`. The order service parses and hashes the request, acquires a PostgreSQL advisory transaction lock based on the key, and stores the response and order in a transaction. A repeat with the same key and request hash replays the saved response; reuse of that key with a different hash returns a conflict. Shopify uses `shopify:<webhook ID>` as the idempotency key. Invalid JSON uses a hash of its original bytes. (`app/main.py`, `app/services/orders.py`, `app/services/shopify_webhooks.py`.)
+
+The supplied `Idempotency-Key` also applies to governed order creation and stock adjustment requests. Stock adjustment uses a deterministic approval ID and an advisory transaction lock to replay the original 202 body for the same input; different input returns 409. Without a key, each stock adjustment request creates an approval. (`app/governance/routes.py`, `app/governance/approvals.py`.)
 
 ## Audit data
 
@@ -59,6 +61,8 @@ For `cancel_order`, the approval stores the target UUID in its `input`; `approva
 ## Proposals
 
 Proposal creation sends user text to the selected rule or optional Anthropic proposer with the role-allowed workflow schemas. The returned workflow and input are checked against the registry and its input model before a proposal can be marked `PROPOSED`. A proposal is a stored draft; it cannot call an ERP. Confirmation by its requester passes the validated input to the normal governed workflow path, where role checks, idempotency, and approvals apply. (`app/proposals/proposers.py`, `app/proposals/routes.py`, `app/proposals/service.py`, `app/governance/routes.py`.)
+
+Confirmation passes `PROP:<proposal UUID>` as the idempotency key and the proposal text hash as the audit input hash for every workflow. `create_order` uses that key for order intake; `adjust_stock` uses it for approval replay; `cancel_order` ignores the key and checks eligibility and an existing open cancellation instead. (`app/proposals/routes.py`, `app/governance/routes.py`.)
 
 ## `LEGACY_AUTH`
 

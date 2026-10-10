@@ -139,7 +139,7 @@ def _validation_reasons(exc: ValidationError) -> list[dict]:
 def submit_unmappable_order(raw_body: bytes, reason: str, idempotency_key: str) -> tuple[int, dict]:
     try:
         payload = json.loads(raw_body, parse_constant=_reject_constant, parse_float=_parse_finite_float)
-    except (NonFiniteJSON, json.JSONDecodeError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError):
         return submit_order(raw_body, idempotency_key)
     if _contains_nul(payload):
         return submit_order(raw_body, idempotency_key)
@@ -161,7 +161,7 @@ def submit_order(
         raw_payload = raw_body.decode("utf-8", errors="replace").replace("\x00", "\\u0000")
         digest = hashlib.sha256(raw_body).hexdigest()
         return _rejected_order(raw_payload, [{"field": "body", "reason": str(exc)}], idempotency_key, digest, requested_by)
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError):
         raw_payload = raw_body.decode("utf-8", errors="replace").replace("\x00", "\\u0000")
         digest = hashlib.sha256(raw_body).hexdigest()
         return _rejected_order(raw_payload, [{"field": "body", "reason": "Invalid JSON"}], idempotency_key, digest, requested_by)

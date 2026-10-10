@@ -10,6 +10,7 @@ class FakeOdoo:
         self.products: dict[str, list[dict]] = defaultdict(list)
         self.partners: list[dict] = []
         self.orders: dict[str, dict] = {}
+        self.order_currency = "USD"
         self.quants: dict[tuple[int, int], dict] = {}
         self.moves: dict[str, dict] = {}
         self.deliveries: list[dict] = []
@@ -72,6 +73,9 @@ class FakeOdoo:
         return httpx.Response(200, json=result, request=request)
 
     def _dispatch(self, model: str, method: str, args: dict[str, Any]) -> Any:
+        if (model, method) == ("sale.order", "read"):
+            return [{"id": row["id"], "currency_id": [1, row.get("currency", self.order_currency)]}
+                    for row in self.orders.values() if row["id"] in args["ids"]]
         if (model, method) == ("sale.order", "search_read"):
             ref = self._domain_value(args["domain"], "client_order_ref")
             if ref is None:
@@ -100,7 +104,9 @@ class FakeOdoo:
         if (model, method) == ("sale.order", "create"):
             vals = args["vals_list"][0]
             order_id = self._next_id()
-            self.orders[vals["client_order_ref"]] = {"id": order_id, "state": "draft", **vals}
+            self.orders[vals["client_order_ref"]] = {
+                "id": order_id, "state": "draft", "currency": self.order_currency, **vals,
+            }
             return [order_id]
         if (model, method) == ("sale.order", "action_confirm"):
             for order in self.orders.values():

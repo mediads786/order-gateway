@@ -24,7 +24,10 @@ class MockErpAdapter:
         }
         response = self.client.post(f"{self.base_url}/sales-orders", json=payload, timeout=self.timeout)
         if response.status_code in (200, 201, 409):
-            erp_order_id = response.json().get("erp_order_id")
+            result = response.json()
+            if not isinstance(result, dict):
+                raise ValueError("ERP response did not include a valid erp_order_id")
+            erp_order_id = result.get("erp_order_id")
             if isinstance(erp_order_id, str) and erp_order_id:
                 return ErpOrderResult(erp_order_id, response.status_code == 409)
             raise ValueError("ERP response did not include a valid erp_order_id")

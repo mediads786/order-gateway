@@ -120,6 +120,8 @@ async def request_workflow(request: Request, name: str):
     status, body = await run_governed_request(
         api_key, name, input_data, request.headers.get("Idempotency-Key"), request_id, input_hash,
     )
+    if name == "adjust_stock" and status == 202:
+        return _response(status, body, uuid.UUID(body["request_id"]))
     return _response(status, body, request_id)
 
 
@@ -229,11 +231,17 @@ async def run_governed_request(
             await _record(api_key, request_id, name, input_hash, "workflow.not_executable", 501,
                           detail={"reason": "adapter_not_supported"})
             return 501, {"error": "adapter_not_supported", "request_id": str(request_id)}
-        from app.governance.approvals import create_adjustment_approval
+        from app.governance.approvals import AdjustmentIdempotencyConflict, create_adjustment_approval
 
         try:
-            approval_id = await run_in_threadpool(
+            approval_id, response_request_id = await run_in_threadpool(
                 create_adjustment_approval, request_id, validated.model_dump(mode="json"), api_key.key_id, api_key.name,
+                idempotency_key,
+            )
+        except AdjustmentIdempotencyConflict:
+            return await _reject_request_body(
+                api_key, request_id, name, input_hash, 409,
+                {"error": "idempotency_key_conflict", "request_id": str(request_id)},
             )
         except Exception as exc:
             logger.exception("Could not create adjustment approval request_id=%s", request_id)
@@ -242,7 +250,7 @@ async def run_governed_request(
             return 500, {"error": "internal_error", "request_id": str(request_id)}
         await _record(api_key, request_id, name, input_hash, "workflow.approval_requested", 202,
                       detail={"approval_id": str(approval_id)})
-        body = {"request_id": str(request_id), "workflow": name,
+        body = {"request_id": str(response_request_id), "workflow": name,
                 "approval_id": str(approval_id), "status": "PENDING_APPROVAL"}
         return 202, body
 

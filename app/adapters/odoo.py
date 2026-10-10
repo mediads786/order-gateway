@@ -106,6 +106,8 @@ class OdooAdapter:
             odoo_id, state = record.get("id"), record.get("state")
             if type(odoo_id) is not int:
                 raise ValueError("Odoo sale.order/search_read omitted id")
+            if state in ("sale", "done", "draft", "sent"):
+                self._check_order_currency(odoo_id, order.currency, identity)
             if state in ("sale", "done"):
                 return ErpOrderResult(str(odoo_id), True)
             if state in ("draft", "sent"):
@@ -140,8 +142,24 @@ class OdooAdapter:
             **identity,
         )
         odoo_id = self._created_id(created, "sale.order/create")
+        self._check_order_currency(odoo_id, order.currency, identity)
         self._confirm_order(odoo_id, identity)
         return ErpOrderResult(str(odoo_id), False)
+
+    def _check_order_currency(self, order_id: int, expected: str, identity: dict[str, str]) -> None:
+        records = self._call(
+            "sale.order", "read", {"ids": [order_id], "fields": ["currency_id"]}, **identity,
+        )
+        if not isinstance(records, list) or len(records) != 1 or not isinstance(records[0], dict):
+            raise ValueError("Odoo sale.order/read returned an invalid response")
+        currency = records[0].get("currency_id")
+        if (not isinstance(currency, list) or len(currency) != 2
+                or type(currency[0]) is not int or not isinstance(currency[1], str)):
+            raise ValueError("Odoo sale.order/read omitted currency")
+        actual = currency[1]
+        if actual != expected:
+            message = f"currency_mismatch:{expected}:{actual}"
+            raise NonRetryableAdapterError(message, message)
 
     def _confirm_order(self, order_id: int, identity: dict[str, str]) -> None:
         result = self._call("sale.order", "action_confirm", {"ids": [order_id]}, **identity)
@@ -263,13 +281,16 @@ class OdooAdapter:
             {"domain": [["code", "=", self.warehouse_code]], "fields": ["id", "lot_stock_id"], "limit": 1},
             shipment_id=shipment_id,
         )
-        if not isinstance(warehouse, list) or not warehouse or not isinstance(warehouse[0], dict):
+        if not isinstance(warehouse, list) or any(not isinstance(row, dict) for row in warehouse):
+            raise ValueError("Odoo stock.warehouse/search_read returned an invalid response")
+        if not warehouse:
             raise NonRetryableAdapterError("warehouse_not_found", f"unknown_warehouse:{self.warehouse_code}")
         location_ref = warehouse[0].get("lot_stock_id")
         if not isinstance(location_ref, list) or not location_ref or not isinstance(location_ref[0], int):
             raise ValueError("Odoo warehouse response omitted its stock location")
         location_id = location_ref[0]
 
+        changes: list[tuple[int, Decimal, str]] = []
         for line in lines:
             products = self._call(
                 "product.product", "search_read",
@@ -312,7 +333,9 @@ class OdooAdapter:
             on_hand = Decimal(str(quants[0].get("quantity", 0)))
             if type(quant_id) is not int or on_hand < line.qty:
                 raise NonRetryableAdapterError(f"insufficient_stock:{line.sku}", f"insufficient_stock:{line.sku}")
-            self._apply_counted_quantity(quant_id, float(on_hand - line.qty), marker, shipment_id=shipment_id)
+            changes.append((quant_id, on_hand - line.qty, marker))
+        for quant_id, quantity, marker in changes:
+            self._apply_counted_quantity(quant_id, float(quantity), marker, shipment_id=shipment_id)
         return f"GW-SHIP:{shipment_id}"
 
     def adjust_stock(self, reference: str, sku: str, qty_delta: int, reason: str) -> dict:
@@ -322,7 +345,9 @@ class OdooAdapter:
             {"domain": [["code", "=", self.warehouse_code]], "fields": ["id", "lot_stock_id"], "limit": 1},
             approval_id=approval_id,
         )
-        if not isinstance(warehouse, list) or not warehouse or not isinstance(warehouse[0], dict):
+        if not isinstance(warehouse, list) or any(not isinstance(row, dict) for row in warehouse):
+            raise ValueError("Odoo stock.warehouse/search_read returned an invalid response")
+        if not warehouse:
             raise NonRetryableAdapterError("warehouse_not_found", f"unknown_warehouse:{self.warehouse_code}")
         location_ref = warehouse[0].get("lot_stock_id")
         if not isinstance(location_ref, list) or not location_ref or type(location_ref[0]) is not int:
@@ -387,7 +412,9 @@ class OdooAdapter:
             "stock.warehouse", "search_read",
             {"domain": [["code", "=", self.warehouse_code]], "fields": ["id", "lot_stock_id"], "limit": 1},
         )
-        if not isinstance(warehouse, list) or not warehouse or not isinstance(warehouse[0], dict):
+        if not isinstance(warehouse, list) or any(not isinstance(row, dict) for row in warehouse):
+            raise ValueError("Odoo stock.warehouse/search_read returned an invalid response")
+        if not warehouse:
             raise NonRetryableAdapterError("warehouse_not_found", f"unknown_warehouse:{self.warehouse_code}")
         location = warehouse[0].get("lot_stock_id")
         products = self._call(

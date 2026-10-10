@@ -41,6 +41,7 @@ def test_auth_headers_golden_mapping_and_decimal_boundary(caplog):
             ("res.partner", "search_read"): [],
             ("res.partner", "create"): [4],
             ("sale.order", "create"): [5],
+            ("sale.order", "read"): [{"id": 5, "currency_id": [1, "USD"]}],
             ("sale.order", "action_confirm"): True,
         }
         return httpx.Response(200, json=responses[(model, method)], request=request)
@@ -55,7 +56,7 @@ def test_auth_headers_golden_mapping_and_decimal_boundary(caplog):
     ])
     result = adapter.create_sales_order(order)
     assert result.erp_order_id == "5" and not result.duplicate
-    assert len(calls) == 6
+    assert len(calls) == 7
     for request, *_ in calls:
         assert request.headers["authorization"] == f"bearer {secret}"
         assert request.headers["x-odoo-database"] == "gateway"
@@ -78,7 +79,10 @@ def test_auth_headers_golden_mapping_and_decimal_boundary(caplog):
 def test_existing_sale_order_response_uses_recorded_shape():
     fixture = recorded("order_found.json")
     client = httpx.Client(transport=httpx.MockTransport(
-        lambda request: httpx.Response(200, json=fixture["response"], request=request)
+        lambda request: httpx.Response(
+            200, json=([{"currency_id": [1, "USD"]}] if request.url.path.endswith("/read")
+                       else fixture["response"]), request=request,
+        )
     ))
     result = OdooAdapter("http://odoo.test", "key", client=client).create_sales_order(adapter_order())
     assert result.erp_order_id == str(fixture["response"][0]["id"])

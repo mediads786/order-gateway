@@ -9,11 +9,12 @@ from datetime import datetime, timezone
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy import func, select, update
 from starlette.concurrency import run_in_threadpool
 
 from app.db.models import ApiKey, Proposal, WorkflowEvent
+from app.core.schemas import reject_nul
 from app.db.session import SessionLocal
 from app.governance.keys import authenticate_api_key
 from app.governance.registry import WORKFLOWS, can_request
@@ -43,6 +44,11 @@ class ProposalRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     text: str = Field(min_length=1)
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        return reject_nul(value)
 
 
 def _response(status: int, body: dict, request_id: uuid.UUID | None = None) -> JSONResponse:

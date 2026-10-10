@@ -6,7 +6,7 @@
 
 ## Context
 
-The recorded buyer-demand check identified Shopify webhooks as the most commonly requested integration source. Delivery is at-least-once, so duplicate protection is required. Unmappable orders need a useful rejection reason rather than canonical-schema errors about the raw Shopify payload.
+Shopify was chosen as a commonly requested integration source, based on the owner's own review of marketplace listings (not independently verified). Delivery is at-least-once, so duplicate protection is required. Unmappable orders need a useful rejection reason rather than canonical-schema errors about the raw Shopify payload.
 
 ## Decision
 

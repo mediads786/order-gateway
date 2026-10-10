@@ -160,7 +160,11 @@ Defaults below come from `.env.example`, `docker-compose.yml`, or the code. Valu
 - Manual retry and cancellation lock the order and job in opposite orders. Concurrent requests on the same dead order can deadlock; PostgreSQL aborts one of them.
 - A shipment and cancellation of the same order are not coordinated. Replaying an applied shipment after cancellation returns order_not_confirmed.
 - Order audit events rely on application code to remain append-only; only workflow events have a database trigger.
-- The original /orders route accepts any order size or value without the governed approval threshold, even with LEGACY_AUTH=key.
+- The original /orders route skips the governed approval threshold and is subject to the numeric and line limits, even with LEGACY_AUTH=key.
+- With `PROPOSER=anthropic`, the daily quota is enforced after the model call, so concurrent requests can exceed it before being refused.
+- Workflow decision events are written in a separate step from the business change, so an interruption can leave a decision without its audit event.
+- Transitive dependencies are not locked, container images and CI actions use mutable tags, and the container runs as root.
+- No license file is present.
 - /health always reports healthy, so it does not detect a stopped worker.
 
 ## Further reading

@@ -4,7 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.core.schemas import OrderInput
+from app.core.schemas import OrderInput, reject_nul
 
 
 class AdjustStockInput(BaseModel):
@@ -14,6 +14,11 @@ class AdjustStockInput(BaseModel):
     sku: str = Field(min_length=1)
     qty_delta: int = Field(strict=True)
     reason: str = Field(min_length=1, max_length=200)
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        return reject_nul(value)
 
     @field_validator("qty_delta")
     @classmethod
@@ -28,6 +33,11 @@ class CancelOrderInput(BaseModel):
 
     order_id: uuid.UUID
     reason: str = Field(min_length=1, max_length=200)
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        return reject_nul(value)
 
 
 @dataclass(frozen=True)

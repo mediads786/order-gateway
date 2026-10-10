@@ -10,7 +10,7 @@ ERP delivery can fail temporarily or permanently. Immediate retries can overload
 
 ## Decision
 
-Retry timeouts, transport errors, HTTP 429, HTTP 5xx, and invalid delivery responses. Treat other HTTP 4xx and permanent adapter errors as non-retryable; Odoo also classifies business errors by name. Use capped exponential backoff with jitter and five attempts by default. Move permanent or exhausted failures to FAILED_DEAD and require manual requeueing. Recover stale PROCESSING jobs or fail them when attempts are exhausted. Write audit events for each attempt and its outcome.
+Retry timeouts, transport errors, HTTP 429, HTTP 5xx, and invalid adapter responses, including malformed successful JSON shapes reported as ValueError. Treat other HTTP 4xx and permanent adapter errors as non-retryable; Odoo also classifies business errors by name. Use capped exponential backoff with jitter and five attempts by default. Move permanent or exhausted failures to FAILED_DEAD and require manual requeueing. Recover stale PROCESSING jobs or fail them when attempts are exhausted. Write audit events for each attempt and its outcome.
 
 ## Consequences
 

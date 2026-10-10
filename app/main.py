@@ -16,7 +16,7 @@ from app.db.models import Order
 from app.db.session import SessionLocal
 from app.adapters import get_adapter
 from app.adapters.factory import AdapterConfigurationError
-from app.core.schemas import ShipmentInput
+from app.core.schemas import MAX_REQUEST_BODY_BYTES, ShipmentInput
 from app.services.orders import serialize_order, submit_order, submit_unmappable_order
 from app.services.shipments import apply_shipment, canonical_request_hash
 from app.services.shopify_webhooks import UnmappableShopifyOrder, map_shopify_order, verify_signature
@@ -68,12 +68,14 @@ async def admin_response_headers(request: Request, call_next):
 
 @app.post("/orders")
 async def create_order(request: Request, response: Response, idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
+    raw_body = await request.body()
+    if len(raw_body) > MAX_REQUEST_BODY_BYTES:
+        return JSONResponse(status_code=413, content={"error": "request_body_too_large"})
     actor = await legacy_guard(request, "legacy:create_order", ("operator", "admin"))
     if isinstance(actor, JSONResponse):
         return actor
     if not idempotency_key:
         raise HTTPException(status_code=400, detail="Idempotency-Key header is required")
-    raw_body = await request.body()
     if actor is None:
         status_code, body = await run_in_threadpool(submit_order, raw_body, idempotency_key)
     else:
@@ -87,6 +89,8 @@ async def create_order(request: Request, response: Response, idempotency_key: st
 @app.post("/webhooks/shopify/orders-create")
 async def shopify_orders_create(request: Request):
     raw_body = await request.body()
+    if len(raw_body) > MAX_REQUEST_BODY_BYTES:
+        return JSONResponse(status_code=413, content={"error": "request_body_too_large"})
     secret = os.getenv("SHOPIFY_WEBHOOK_SECRET", "")
     if not secret:
         logger.error("Shopify webhook secret is not configured")
@@ -107,7 +111,7 @@ async def shopify_orders_create(request: Request):
     idempotency_key = f"shopify:{webhook_id}"
     try:
         payload = json.loads(raw_body)
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError):
         status_code, body = await run_in_threadpool(submit_order, raw_body, idempotency_key)
     else:
         try:
@@ -139,6 +143,8 @@ def _shipment_json_constant(value: str):
 @app.post("/shipments")
 async def create_shipment(request: Request):
     raw_body = await request.body()
+    if len(raw_body) > MAX_REQUEST_BODY_BYTES:
+        return JSONResponse(status_code=413, content={"error": "request_body_too_large"})
     secret = os.getenv("SHIPMENT_WEBHOOK_SECRET", "")
     if not secret:
         logger.error("Shipment webhook secret is not configured")

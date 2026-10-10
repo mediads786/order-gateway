@@ -8,7 +8,7 @@ from typing import Literal
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
 
@@ -28,6 +28,10 @@ APPROVAL_STATES = ("PENDING", "APPROVED", "REJECTED", "EXECUTED", "EXECUTION_FAI
 
 
 class LocalCancellationUpdateError(RuntimeError):
+    pass
+
+
+class AdjustmentIdempotencyConflict(ValueError):
     pass
 
 
@@ -155,9 +159,18 @@ def _approval_dict(db, approval: Approval) -> dict:
 
 def create_adjustment_approval(
     request_id: uuid.UUID, input_data: dict, key_id: uuid.UUID, key_name: str,
-) -> uuid.UUID:
-    approval_id = uuid.uuid4()
+    idempotency_key: str | None = None,
+) -> tuple[uuid.UUID, uuid.UUID]:
+    approval_id = (uuid.uuid5(uuid.NAMESPACE_URL, f"order-gateway:adjust_stock:{idempotency_key}")
+                   if idempotency_key else uuid.uuid4())
     with SessionLocal.begin() as db:
+        if idempotency_key:
+            db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": str(approval_id)})
+            previous = db.get(Approval, approval_id)
+            if previous is not None:
+                if previous.input != input_data:
+                    raise AdjustmentIdempotencyConflict("idempotency_key_conflict")
+                return previous.approval_id, previous.request_id
         db.add(Approval(
             approval_id=approval_id,
             request_id=request_id,
@@ -167,7 +180,7 @@ def create_adjustment_approval(
             requested_by_key_id=key_id,
             requested_by_name=key_name,
         ))
-    return approval_id
+    return approval_id, request_id
 
 
 def _approval_snapshot(approval_id: uuid.UUID) -> Approval | None:

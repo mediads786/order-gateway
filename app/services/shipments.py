@@ -1,14 +1,16 @@
 import hashlib
+import inspect
 import json
 import logging
 from datetime import datetime, timezone
 import uuid
 
+import anyio
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from starlette.concurrency import run_in_threadpool
 
-from app.adapters import ErpAdapter, NonRetryableAdapterError, ShipmentLine
+from app.adapters import ErpAdapter, ShipmentLine
 from app.db.models import AuditEvent, Order, Shipment
 from app.db.session import SessionLocal
 from app.workers.worker import classify_failure
@@ -18,6 +20,11 @@ logger = logging.getLogger(__name__)
 
 async def apply_shipment(shipment_id: str, order_id: uuid.UUID, lines: list[dict[str, str | int]], request_hash: str,
                          adapter: ErpAdapter) -> tuple[int, dict]:
+    return await run_in_threadpool(_apply_shipment, shipment_id, order_id, lines, request_hash, adapter)
+
+
+def _apply_shipment(shipment_id: str, order_id: uuid.UUID, lines: list[dict[str, str | int]], request_hash: str,
+                    adapter: ErpAdapter) -> tuple[int, dict]:
     canonical_lines = [{"sku": line["sku"], "qty": line["qty"]} for line in lines]
     seen_skus: set[str] = set()
     for line in canonical_lines:
@@ -60,9 +67,10 @@ async def apply_shipment(shipment_id: str, order_id: uuid.UUID, lines: list[dict
         db.flush()
         adapter_lines = [ShipmentLine(sku=line["sku"], qty=line["qty"]) for line in canonical_lines]
         try:
-            erp_reference = await run_in_threadpool(
-                adapter.adjust_stock_for_shipment, shipment_id, adapter_lines,
-            )
+            if inspect.iscoroutinefunction(adapter.adjust_stock_for_shipment):
+                erp_reference = anyio.from_thread.run(adapter.adjust_stock_for_shipment, shipment_id, adapter_lines)
+            else:
+                erp_reference = adapter.adjust_stock_for_shipment(shipment_id, adapter_lines)
         except Exception as exc:
             retryable, _ = classify_failure(invalid_response=True) if isinstance(exc, ValueError) else classify_failure(error=exc)
             error = f"{type(exc).__name__}: {exc}"[:500]
