@@ -164,7 +164,7 @@ Defaults below come from `.env.example`, `docker-compose.yml`, or the code. Valu
 - With `PROPOSER=anthropic`, the daily quota is enforced after the model call, so concurrent requests can exceed it before being refused.
 - Workflow decision events are written in a separate step from the business change, so an interruption can leave a decision without its audit event.
 - Transitive dependencies are not locked, container images and CI actions use mutable tags, and the container runs as root.
-- No license file is present.
+-.
 - /health always reports healthy, so it does not detect a stopped worker.
 
 ## Further reading
@@ -175,3 +175,7 @@ Defaults below come from `.env.example`, `docker-compose.yml`, or the code. Valu
 - [Odoo JSON-2 notes](docs/odoo-notes.md)
 - [Odoo end-to-end run](docs/odoo-e2e-run.md)
 - [Architecture decision records](docs/adr/README.md)
+
+## License
+
+MIT. See [LICENSE](LICENSE).
