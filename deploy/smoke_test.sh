@@ -3,6 +3,7 @@ set +x
 set -Eeuo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
 load_env
+python3 "$ROOT/deploy/credentials.py" check
 check_ports
 # Production verifies public TLS. Local mode is accepted ONLY for DOMAIN=localhost.
 case ${1:-} in

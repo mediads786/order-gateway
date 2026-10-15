@@ -8,7 +8,8 @@ ports: TCP 80 and 443. PostgreSQL uses the existing `postgres_data` named volume
 All commands below use placeholders. Substitute values in your terminal, never in
 tracked files. Do not capture bootstrap output in logs or paste it into a ticket.
 The bootstrap script creates real credentials only in the target server's protected
-`.env` and displays newly generated credentials once for you to save securely.
+`.env`; generated values are never printed. Both bootstrap and local verification
+use `deploy/credentials.py` to generate and validate the same credential bytes.
 
 ## a. Create the AWS account and choose Free plan
 
@@ -174,12 +175,12 @@ does not exist. Never upload your local development `.env`.
    sudo bash /opt/order-gateway/deploy/ec2-bootstrap.sh YOUR_HOSTNAME
    ```
 
-   Save the displayed secrets **once** in a password manager. Do not use terminal
+   Save the protected `.env` credentials privately in a password manager. Do not use terminal
    recording, `tee`, `bash -x`, or screen sharing. Bootstrap installs Docker from
    its official Ubuntu repository, creates swap, enables UFW, generates `.env`
    with mode 600, starts all five core services, registers API key hashes, and
    installs the nightly backup timer. It preserves an existing `.env` and never
-   redisplays or regenerates existing secrets. A failed first start can be retried
+   prints or regenerates existing secrets. A failed first start can be retried
    with the same command. If an existing swap or firewall setup is unexpected,
    inspect it rather than deleting it blindly.
 
@@ -189,8 +190,10 @@ does not exist. Never upload your local development `.env`.
    sudo bash /opt/order-gateway/deploy/smoke_test.sh
    ```
 
-   Expect PASS for HTTPS/health, invalid Shopify HMAC rejection, `/admin*` basic-auth
-   rejection, the second admin login layer, and a signed order reaching `CONFIRMED`.
+   Expect PASS for credential consistency, HTTPS/health, invalid Shopify HMAC
+   rejection, missing/wrong Basic Auth rejection, valid Basic Auth, the separate
+   `ADMIN_TOKEN` login, secure session cookies, and a signed order reaching `CONFIRMED`.
+   A failed check prints its name without credentials or response bodies and exits non-zero.
    In a browser, open `https://YOUR_HOSTNAME/admin`. Enter username `gateway` and
    the generated basic-auth password, then enter the separate `ADMIN_TOKEN` in
    the app's login form. API clients use their role-specific `X-API-Key`.
@@ -320,6 +323,7 @@ unredacted logs: environment/config output can reveal credentials.
 | Certificate not issuing | Confirm public A record/sslip hostname resolves to the associated Elastic IP; remove bad AAAA records; allow TCP 80/443 in both security group and UFW; check outbound DNS/HTTPS, CAA restrictions, CA rate limits, and `compose logs --tail 50 caddy` locally. Wait for DNS/CA retry. Localhost certificates are private, not valid for Shopify. |
 | Caddy returns 502 | Run `compose ps`; inspect API health, `compose logs --tail 50 api`, migrations and database readiness. Proxy target is `api:8000`, not a host-published port. Check disk/memory and rebuild with the update procedure. |
 | Shopify webhook returns 401 | Compare the protected signing secret with Shopify's webhook configuration; recreate API after changes. HMAC must sign the exact original raw bytes with SHA256 and base64. API keys and basic-auth passwords are not Shopify signing secrets. Basic auth applies only to `/admin*`. |
+| Generated Basic Auth credentials return 401 | Run `source deploy/common.sh; load_env; python3 deploy/credentials.py check` in a private operator shell. The shared generator hashes the exact password bytes with Caddy-compatible bcrypt; do not hash terminal input with `read` or include CR/LF. Keep the raw hash single-quoted in `.env`: Compose substitutes `${CADDY_BASIC_AUTH_HASH}` once and passes its dollars unchanged to Caddy. Do not change those dollars to `$$`; escaping is needed for a hash written literally into Compose YAML, not this variable value. `compose config` can display doubled dollars for serialization, so it is not a byte-for-byte view of the container environment. Never print either output to troubleshoot credentials. |
 | Disk space low | Check `df -h`, `sudo du -sh /var/lib/docker /opt/order-gateway/deploy/backups`, and `docker system df`. Container logs rotate at 10 MB × 3 per service; PostgreSQL, images, system logs and dumps still grow. After a successful backup, `docker image prune` can remove unused dangling images. Expand EBS/filesystem or export/remove old dumps deliberately. Never prune volumes or delete PostgreSQL files. |
 | Bootstrap fails with existing configuration | Existing `.env` and secrets are preserved. Ensure DOMAIN argument matches, `.env` mode is 600, and firewall/swap checks pass. Re-run after fixing the reported condition. Do not regenerate the DB password for an existing volume. |
 | Backup timer fails | Inspect `systemctl status order-gateway-backup.service` and its journal locally; check disk space, DB health, optional AWS CLI/role/bucket access. A timer cannot run while EC2 is stopped. |
@@ -345,21 +349,34 @@ monitor free space and backup/database growth.
 
 Use a Linux/Docker-capable environment with Bash, Python 3, and Compose >=2.24.4.
 Do not overwrite an existing development `.env` or use an existing production volume.
-In a disposable checkout, create a **temporary local-only** `.env` using the same
-generation logic in bootstrap (install Python bcrypt first), with `DOMAIN=localhost`.
-Register the keys after migrations as bootstrap does. Never commit that file.
+In a disposable checkout, install Python bcrypt (on Ubuntu, `python3-bcrypt`).
+Use the exact bootstrap generator below, never a hand-made password/hash or a
+shell `read`/`caddy hash-password` pipeline: Windows text-mode stdin can append a
+carriage return to the password being hashed. The generator writes LF-only,
+single-quoted `.env` entries with mode 600, verifies the password/hash pair, and
+refuses to overwrite an existing `.env`; it never prints secrets.
+The unique local project name keeps disposable volumes separate from development.
+Run these commands only in that disposable checkout, with 80/443 available.
 
 ```bash
-docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml up -d --build --wait
-# Load deployment values, verify the merged model without printing credentials,
-# and register generated API keys (same helper as bootstrap).
+python3 deploy/credentials.py generate localhost --project order-gateway-local-check
 source deploy/common.sh
 load_env
+python3 deploy/credentials.py check
 check_ports
+compose up -d --build --wait --wait-timeout 180 db api mock_erp worker caddy
+# Register generated API keys after migrations, exactly as bootstrap does.
 python3 -c 'import json,os; print(json.dumps({n:os.environ[n] for n in ("DEPLOY_OPERATOR_API_KEY","DEPLOY_APPROVER_API_KEY","DEPLOY_ADMIN_API_KEY")}))' | compose exec -T api python -c "$(cat deploy/init-api-keys.py)"
 bash deploy/smoke_test.sh --local-tls
-docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml down
+# DISPOSABLE LOCAL PROJECT ONLY: delete its containers and named volumes.
+compose down --volumes --remove-orphans
+rm -- .env
 ```
+
+The previous local 401 had a different password/hash pair because its Windows
+harness hashed a trailing CR; the original bootstrap bcrypt generation and
+single-quoted Compose variable transport both authenticate correctly at runtime.
+The shared generator and credential preflight prevent that divergent test path.
 
 `--local-tls` skips trust validation only for `localhost` because Caddy uses its
 local CA. Never use it for a public server. It still tests HTTPS, authentication,

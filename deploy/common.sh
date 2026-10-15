@@ -17,10 +17,10 @@ load_env() {
     source .env
     set +a
     unset COMPOSE_PROFILES COMPOSE_FILE
-    export COMPOSE_PROJECT_NAME=order-gateway
+    export COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-order-gateway}
 }
 compose() {
-    docker compose --env-file "$ROOT/.env" -p order-gateway \
+    docker compose --env-file "$ROOT/.env" -p "${COMPOSE_PROJECT_NAME:-order-gateway}" \
         -f "$ROOT/docker-compose.yml" -f "$ROOT/deploy/docker-compose.prod.yml" "$@"
 }
 check_ports() {

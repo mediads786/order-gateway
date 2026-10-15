@@ -58,28 +58,9 @@ cd "$INSTALL_DIR"
 [[ -f deploy/docker-compose.prod.yml ]] || { echo 'Deployment kit absent: publish the reviewed commit or copy the kit here first.' >&2; exit 1; }
 chmod 700 "$INSTALL_DIR"
 if [[ ! -e .env ]]; then
-    # Exclusive creation prevents overwrites. Values are saved only on the target server.
-    python3 - "$DOMAIN_ARG" <<'PY'
-import bcrypt, os, secrets, sys
-v = dict(DOMAIN=sys.argv[1], COMPOSE_PROJECT_NAME='order-gateway', ERP_ADAPTER='mock',
-         ERP_BASE_URL='http://mock_erp:9001', LEGACY_AUTH='key', PROPOSER='rule',
-         CADDY_BASIC_AUTH_USER='gateway', S3_BACKUP_BUCKET='')
-for name in ('POSTGRES_PASSWORD','ADMIN_TOKEN','SHOPIFY_WEBHOOK_SECRET',
-             'SHIPMENT_WEBHOOK_SECRET','CADDY_BASIC_AUTH_PASSWORD'):
-    v[name] = secrets.token_hex(32)
-v['CADDY_BASIC_AUTH_HASH'] = bcrypt.hashpw(v['CADDY_BASIC_AUTH_PASSWORD'].encode(), bcrypt.gensalt(rounds=14)).decode()
-for role in ('OPERATOR','APPROVER','ADMIN'):
-    v[f'DEPLOY_{role}_API_KEY'] = 'gw_' + secrets.token_urlsafe(32)
-fd = os.open('.env', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-with os.fdopen(fd, 'w') as f:
-    for key,value in v.items():
-        f.write(f"{key}='{value}'\n")
-print('SAVE THESE NOW in a password manager. Bootstrap will never print them again:')
-for key,value in v.items():
-    if any(word in key for word in ('PASSWORD','TOKEN','SECRET','API_KEY')) and key != 'CADDY_BASIC_AUTH_HASH':
-        print(f'{key}={value}')
-print('CADDY_BASIC_AUTH_USER=gateway')
-PY
+    # The local verification recipe calls this exact generator too.
+    python3 deploy/credentials.py generate "$DOMAIN_ARG"
+    echo 'Save .env credentials privately in a password manager; values are never logged.'
 else
     [[ -f .env && ! -L .env ]] || { echo 'Refusing nonregular .env.' >&2; exit 1; }
     chmod 600 .env
@@ -87,6 +68,7 @@ else
 fi
 source deploy/common.sh
 load_env
+python3 deploy/credentials.py check
 [[ $DOMAIN == "$DOMAIN_ARG" ]] || { echo 'DOMAIN differs from existing .env; edit deliberately before rerunning.' >&2; exit 1; }
 check_ports
 compose build api worker mock_erp

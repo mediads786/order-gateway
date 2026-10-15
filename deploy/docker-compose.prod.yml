@@ -84,6 +84,8 @@ services:
     environment:
       DOMAIN: ${DOMAIN:?Set DOMAIN}
       CADDY_BASIC_AUTH_USER: ${CADDY_BASIC_AUTH_USER:?Set CADDY_BASIC_AUTH_USER}
+      # Substitute the raw, single-quoted .env value once; do not add $$ escaping.
+      # Compose config displays escaped dollars; container bytes remain unchanged.
       CADDY_BASIC_AUTH_HASH: ${CADDY_BASIC_AUTH_HASH:?Set CADDY_BASIC_AUTH_HASH}
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
