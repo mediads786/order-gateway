@@ -1,0 +1,4 @@
+backups/
+.maintenance.lock
+__pycache__/
+*.pyc

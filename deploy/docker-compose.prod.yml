@@ -1,0 +1,104 @@
+# Requires Docker Compose >= 2.24.4. Always combine with ../docker-compose.yml.
+x-logging: &bounded-logs
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  db:
+    ports: !reset []
+    restart: unless-stopped
+    logging: *bounded-logs
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    # The base file already mounts the named postgres_data volume.
+  api:
+    ports: !reset []
+    restart: unless-stopped
+    logging: *bounded-logs
+    # Only Caddy is publicly reachable. Trust its forwarded HTTPS scheme so the
+    # existing admin login issues Secure cookies behind the container proxy.
+    command: [sh, -c, "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips='*'"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://order_gateway:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@db:5432/order_gateway
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?Set ADMIN_TOKEN}
+      SHOPIFY_WEBHOOK_SECRET: ${SHOPIFY_WEBHOOK_SECRET:?Set SHOPIFY_WEBHOOK_SECRET}
+      SHIPMENT_WEBHOOK_SECRET: ${SHIPMENT_WEBHOOK_SECRET:?Set SHIPMENT_WEBHOOK_SECRET}
+      ERP_ADAPTER: mock
+      ERP_BASE_URL: http://mock_erp:9001
+      LEGACY_AUTH: key
+      PROPOSER: rule
+      ANTHROPIC_API_KEY: ""
+      ODOO_BASE_URL: ""
+      ODOO_API_KEY: ""
+  mock_erp:
+    ports: !reset []
+    restart: unless-stopped
+    logging: *bounded-logs
+  worker:
+    restart: unless-stopped
+    logging: *bounded-logs
+    environment:
+      DATABASE_URL: postgresql+psycopg://order_gateway:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@db:5432/order_gateway
+      ERP_ADAPTER: mock
+      ERP_BASE_URL: http://mock_erp:9001
+      ODOO_BASE_URL: ""
+      ODOO_API_KEY: ""
+    healthcheck:
+      # Checks process identity and dependencies, not progress through the loop.
+      test:
+        - CMD
+        - python
+        - -c
+        - "from pathlib import Path; import urllib.request; from sqlalchemy import text; from app.db.session import engine; assert b'app.workers.worker' in Path('/proc/1/cmdline').read_bytes(); urllib.request.urlopen('http://mock_erp:9001/sales-orders', timeout=3); c=engine.connect(); c.execute(text('SELECT 1')); c.close()"
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+  # These remain opt-in in the base file. No deployment script enables them.
+  odoo-db:
+    restart: unless-stopped
+    logging: *bounded-logs
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$${POSTGRES_USER}"']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+  odoo:
+    ports: !reset []
+    restart: unless-stopped
+    logging: *bounded-logs
+    healthcheck:
+      test: [CMD, python3, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8069/web/login', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+  caddy:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    logging: *bounded-logs
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN}
+      CADDY_BASIC_AUTH_USER: ${CADDY_BASIC_AUTH_USER:?Set CADDY_BASIC_AUTH_USER}
+      CADDY_BASIC_AUTH_HASH: ${CADDY_BASIC_AUTH_HASH:?Set CADDY_BASIC_AUTH_HASH}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    healthcheck:
+      # Local admin API is bound only to loopback inside this container.
+      test: [CMD, wget, -q, -O, /dev/null, "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  caddy_data:
+  caddy_config:
