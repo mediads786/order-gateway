@@ -6,6 +6,8 @@ After more than 25 years in operations management, I wanted to build integration
 
 Order Gateway is my build of that problem. It is a learning project and a demonstration, not a production system, and this page says plainly what has and has not been verified.
 
+Evidence updated on 17 October 2026: the [verified-results summary](verification-summary.md) reconciles the later owner-performed Shopify-to-Odoo test, AWS deployment checks and existing regression evidence without publishing private infrastructure or customer data.
+
 ## What I built
 
 The gateway accepts an order over an API, validates it, calculates the total with exact decimal arithmetic, and stores the order, its delivery job and its audit events in one database transaction. A separate worker delivers jobs to an ERP through an adapter. There are two adapters: a mock ERP with fault injection, used to practise failure handling, and an Odoo 19 adapter.
@@ -34,19 +36,21 @@ I demonstrate this with a script against the mock ERP. It submits an order, repl
 
 - The test suite runs against a real PostgreSQL database, and the CI workflow runs it on every push to the master branch.
 - A real order from a Shopify development store, delivered by signed webhook, reached the confirmed state in the mock ERP.
-- An end-to-end run against a local Odoo 19: an order submitted to the gateway was delivered by the worker and appears in Odoo as a confirmed sale order, and a governed cancellation (requested by one user, approved by another) turned it into a cancelled sale order in Odoo. A second run applied a governed stock adjustment and then signed shipments: Odoo stock moved by exactly the expected amounts, a replayed shipment changed nothing, a reused shipment id with a different body was refused, and a shipment larger than the available stock was refused. An earlier probe had already confirmed the individual Odoo API calls the adapter relies on.
+- An end-to-end run against a local Odoo 19: an order submitted to the gateway was delivered by the worker and appears in Odoo as a confirmed sale order, and a governed cancellation (requested by one API key, approved by a different key) turned it into a cancelled sale order in Odoo. A second run applied a governed stock adjustment and then signed shipments: Odoo stock moved by exactly the expected amounts, a replayed shipment changed nothing, a reused shipment id with a different body was refused, and a shipment larger than the available stock was refused. An earlier probe had already confirmed the individual Odoo API calls the adapter relies on.
+- On 15 October, I performed a real Shopify development-store test: order #1021 reached a confirmed gateway order and Odoo sales order S00054, with matching BOOK/PEN quantities, unit prices and a USD 60.00 total. The retained screenshots and gateway audit support this fixture; general tax reconciliation is outside scope.
+- AWS deployment checks on 15–16 October verified HTTPS, authentication, signed sample delivery to the mock ERP, replay handling, container and host checks, backups and a same-host restore matching row counts across 11 copied tables. The deployment uses a single EC2 host; these checks do not establish high availability or sustained production capacity.
 - The failure-and-recovery demo above runs end to end.
 - Independent read-only code reviews. They found input-validation, shipment-handling and idempotency problems; the confirmed ones were fixed with regression tests, and the remaining concurrency and recovery limits are listed in the README.
 
 ## What is not done yet
 
-- Cloud deployment.
+- Off-server backups and replacement-host recovery were not established by the same-host restore drill.
 - Failure handling against Odoo (for example Odoo going down mid-delivery) has not been exercised, and the runs used a local Odoo only.
 - The optional AI proposer has not been recorded as tested against the live API.
 - The admin pages use one shared token. Per-user identity is needed before real use.
 
 ## What I would do next
 
-First, test failure handling against Odoo, for example by stopping it mid-delivery. Then deploy it, add per-user admin identity, and add alerting so a dead order notifies someone instead of waiting to be noticed.
+Next, test uncertain outcomes and failure handling against Odoo, add off-server recovery, per-user admin identity, and outbound alerting for the Python gateway. Its AWS demonstration is already deployed; notification evidence for the separate n8n implementation is documented in that project's QA report.
 
 For a real client, I would start with their side of the connection: what they send, in what format, how it is authenticated, which field is unique per order, and what the ERP's API allows. Those answers decide the mapper and the adapter, and the rest of the design stays the same.

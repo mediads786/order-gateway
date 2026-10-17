@@ -1,5 +1,7 @@
 # Shopify webhook to Odoo end-to-end proof
 
+**Later evidence update — 17 October 2026:** the owner subsequently performed a real Shopify development-store test on 15 October: #1021 reached confirmed Odoo sales order S00054, with matching lines and a USD 60.00 total. Original screenshots and the gateway audit were reconciled; see the [verified-results summary](verification-summary.md). Statements below that Mode B was not run describe the earlier synthetic run, not the owner's later test. The later review did not locate saved automated Mode B output or a "20/20" result. Historical commands and run output below are retained unchanged.
+
 Date: 2026-10-15 (Asia/Karachi).
 Application commit tested: `5d98720bfbaf9b49bea188e9665afd3ac305cc66`.
 The proof script and this record are committed together after verification;

@@ -9,3 +9,8 @@ __pycache__/
 test-out.txt
 test-err.txt
 order-gateway-project-guide.md
+
+# Private QA originals and screenshots require redacted publication copies.
+/docs/qa/
+# Temporary portfolio checkout and local review tools are not gateway sources.
+/portfolio-work/

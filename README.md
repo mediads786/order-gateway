@@ -4,6 +4,8 @@
 
 Order Gateway is a Python service for accepting orders, recording them in PostgreSQL, and delivering them to an ERP through a separate worker. It provides idempotent intake, retry handling, audit history, and operational controls so that an operator can see and respond to delivery problems; Shopify webhooks, governed workflows, proposals, and an Odoo adapter extend the same order path.
 
+See the [verified-results summary](docs/verification-summary.md), updated 17 October 2026, for the owner-performed real Shopify-to-Odoo fixture, AWS deployment/restore checks, historical regression results and their tested boundaries. Private infrastructure addresses, customer data and credentials are excluded.
+
 ## Architecture
 
 The default Compose stack has PostgreSQL (`db`), the FastAPI service (`api`), the in-memory fault-injectable ERP (`mock_erp`), and the delivery worker (`worker`). The optional `odoo` profile adds `odoo-db` and `odoo`; the application selects the mock or Odoo adapter through `ERP_ADAPTER`. (See [docker-compose.yml](docker-compose.yml) and [app/adapters/factory.py](app/adapters/factory.py).)
