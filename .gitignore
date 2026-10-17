@@ -14,3 +14,15 @@ order-gateway-project-guide.md
 /docs/qa/
 # Temporary portfolio checkout and local review tools are not gateway sources.
 /portfolio-work/
+
+# Private keys, credential exports, databases and raw runtime output.
+*.pem
+*.key
+credentials*.json
+*credentials-decrypted*
+*.dump
+*.backup
+*.sqlite*
+*.log
+/backups/
+/.private/
